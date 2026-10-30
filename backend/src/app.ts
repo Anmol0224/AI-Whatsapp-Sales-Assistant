@@ -4,6 +4,7 @@ import helmet from "helmet";
 import { rateLimit } from "express-rate-limit";
 import { env } from "./config/env.js";
 import errorHandler from "./middleware/error-handler.js";
+import authRouter from "./routes/v1/auth.routes.js";
 import healthRouter from "./routes/v1/health.routes.js";
 
 const app = express();
@@ -33,6 +34,7 @@ const apiRateLimiter = rateLimit({
 app.use(helmet());
 app.use(cors(corsOptions));
 app.use(express.json({ limit: "100kb" }));
+app.use("/api/v1/auth", apiRateLimiter, authRouter);
 app.use("/api/v1", apiRateLimiter, healthRouter);
 
 app.use((_request, response) => {
