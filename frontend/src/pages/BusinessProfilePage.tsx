@@ -1,5 +1,14 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
-import { ApiError, getBusinessProfile, updateBusinessProfile, type BusinessProfile, type BusinessProfileUpdate } from '../services/api'
+import {
+  ApiError,
+  getBusinessProfile,
+  getBusinessWhatsAppSettings,
+  updateBusinessProfile,
+  updateBusinessWhatsAppSettings,
+  type BusinessProfile,
+  type BusinessProfileUpdate,
+  type BusinessWhatsAppSettings,
+} from '../services/api'
 
 type ProfileForm = {
   name: string
@@ -152,6 +161,18 @@ export function BusinessProfilePage() {
   const [saveError, setSaveError] = useState<string | null>(null)
   const [successMessage, setSuccessMessage] = useState<string | null>(null)
   const [fieldErrors, setFieldErrors] = useState<FieldErrors>({})
+  const [whatsappSettings, setWhatsappSettings] = useState<BusinessWhatsAppSettings | null>(null)
+  const [whatsappPhoneNumberId, setWhatsappPhoneNumberId] = useState('')
+  const [whatsappDisplayNumber, setWhatsappDisplayNumber] = useState('')
+  const [whatsappLoading, setWhatsappLoading] = useState(true)
+  const [whatsappLoadError, setWhatsappLoadError] = useState<string | null>(null)
+  const [whatsappLoadAttempt, setWhatsappLoadAttempt] = useState(0)
+  const [whatsappSaving, setWhatsappSaving] = useState(false)
+  const whatsappSavingRef = useRef(false)
+  const [whatsappError, setWhatsappError] = useState<string | null>(null)
+  const [whatsappSuccess, setWhatsappSuccess] = useState<string | null>(null)
+  const [whatsappPhoneNumberIdError, setWhatsappPhoneNumberIdError] = useState<string | null>(null)
+  const [whatsappDisplayNumberError, setWhatsappDisplayNumberError] = useState<string | null>(null)
 
   useEffect(() => {
     let isCurrent = true
@@ -182,6 +203,35 @@ export function BusinessProfilePage() {
       isCurrent = false
     }
   }, [loadAttempt])
+
+  useEffect(() => {
+    let isCurrent = true
+    setWhatsappLoading(true)
+    setWhatsappLoadError(null)
+
+    void getBusinessWhatsAppSettings()
+      .then((result) => {
+        if (!isCurrent) return
+        setWhatsappSettings(result.whatsapp)
+        setWhatsappPhoneNumberId(result.whatsapp.phoneNumberId ?? '')
+        setWhatsappDisplayNumber(result.whatsapp.displayNumber ?? '')
+      })
+      .catch((error: unknown) => {
+        if (!isCurrent) return
+        setWhatsappLoadError(
+          error instanceof ApiError
+            ? error.message
+            : 'Unable to load WhatsApp number settings. Please retry.',
+        )
+      })
+      .finally(() => {
+        if (isCurrent) setWhatsappLoading(false)
+      })
+
+    return () => {
+      isCurrent = false
+    }
+  }, [whatsappLoadAttempt])
 
   function updateField(field: ProfileField, value: string) {
     setForm((current) => ({ ...current, [field]: value }))
@@ -225,6 +275,48 @@ export function BusinessProfilePage() {
     } finally {
       savingRef.current = false
       setSaving(false)
+    }
+  }
+
+  async function handleWhatsAppSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (whatsappSavingRef.current) return
+
+    const phoneNumberId = whatsappPhoneNumberId.trim()
+    const displayNumber = whatsappDisplayNumber.trim()
+    const phoneNumberIdError = /^\d{1,32}$/.test(phoneNumberId)
+      ? null
+      : 'Enter a Phone Number ID containing digits only.'
+    const displayNumberError = displayNumber && !/^\+?[1-9]\d{6,14}$/.test(displayNumber)
+      ? 'Enter an international phone number with 7–15 digits and an optional leading +.'
+      : null
+
+    setWhatsappPhoneNumberIdError(phoneNumberIdError)
+    setWhatsappDisplayNumberError(displayNumberError)
+    setWhatsappError(null)
+    setWhatsappSuccess(null)
+    if (phoneNumberIdError || displayNumberError) return
+
+    whatsappSavingRef.current = true
+    setWhatsappSaving(true)
+    try {
+      const result = await updateBusinessWhatsAppSettings({
+        phoneNumberId,
+        ...(displayNumber ? { displayNumber } : {}),
+      })
+      setWhatsappSettings(result.whatsapp)
+      setWhatsappPhoneNumberId(result.whatsapp.phoneNumberId ?? '')
+      setWhatsappDisplayNumber(result.whatsapp.displayNumber ?? '')
+      setWhatsappSuccess('WhatsApp number settings saved. Meta connectivity has not been verified.')
+    } catch (error) {
+      setWhatsappError(
+        error instanceof ApiError
+          ? error.message
+          : 'Unable to save WhatsApp number settings. Please try again.',
+      )
+    } finally {
+      whatsappSavingRef.current = false
+      setWhatsappSaving(false)
     }
   }
 
@@ -399,6 +491,117 @@ export function BusinessProfilePage() {
           </button>
         </div>
       </form>
+
+      <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7">
+        <div className="mb-6 flex flex-col gap-3 border-b border-slate-100 pb-4 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h3 className="font-semibold text-slate-950">WhatsApp Cloud API</h3>
+            <p className="mt-1 max-w-2xl text-sm leading-6 text-slate-500">
+              Configure the one WhatsApp Business number used by this workspace. Credentials remain on the backend.
+            </p>
+          </div>
+          <span className={`w-fit rounded-full px-3 py-1 text-xs font-semibold ${
+            whatsappSettings?.connectionStatus === 'configured_not_verified'
+              ? 'bg-amber-50 text-amber-800'
+              : 'bg-slate-100 text-slate-600'
+          }`}>
+            {whatsappLoading
+              ? 'Loading status…'
+              : whatsappSettings?.connectionStatus === 'configured_not_verified'
+                ? 'Configured — not verified'
+                : 'Not configured'}
+          </span>
+        </div>
+
+        {whatsappLoading ? (
+          <div role="status" aria-live="polite" className="py-4 text-sm text-slate-600">
+            Loading WhatsApp number settings…
+          </div>
+        ) : whatsappLoadError ? (
+          <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-4">
+            <p className="text-sm text-rose-800">{whatsappLoadError}</p>
+            <button
+              type="button"
+              onClick={() => setWhatsappLoadAttempt((attempt) => attempt + 1)}
+              className="mt-3 rounded-lg bg-white px-3.5 py-2 text-sm font-semibold text-rose-800 outline-none hover:bg-rose-100 focus-visible:ring-2 focus-visible:ring-rose-600 focus-visible:ring-offset-2"
+            >
+              Retry loading
+            </button>
+          </div>
+        ) : (
+          <form onSubmit={(event) => void handleWhatsAppSubmit(event)} noValidate className="space-y-5">
+            <div className="grid gap-5 md:grid-cols-2">
+              <div>
+                <label htmlFor="whatsapp-phone-number-id" className="text-sm font-medium text-slate-800">
+                  WhatsApp Phone Number ID <span className="text-rose-600" aria-hidden="true">*</span>
+                </label>
+                <input
+                  id="whatsapp-phone-number-id"
+                  name="phoneNumberId"
+                  type="text"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  required
+                  maxLength={32}
+                  value={whatsappPhoneNumberId}
+                  onChange={(event) => {
+                    setWhatsappPhoneNumberId(event.target.value)
+                    setWhatsappPhoneNumberIdError(null)
+                    setWhatsappError(null)
+                    setWhatsappSuccess(null)
+                  }}
+                  aria-invalid={Boolean(whatsappPhoneNumberIdError)}
+                  aria-describedby={whatsappPhoneNumberIdError ? 'whatsapp-phone-number-id-error' : 'whatsapp-phone-number-id-hint'}
+                  className={`${inputClassName} ${whatsappPhoneNumberIdError ? 'border-rose-400 focus:border-rose-500 focus:ring-rose-500/10' : ''}`}
+                />
+                {whatsappPhoneNumberIdError
+                  ? <p id="whatsapp-phone-number-id-error" className="mt-1.5 text-xs text-rose-700">{whatsappPhoneNumberIdError}</p>
+                  : <p id="whatsapp-phone-number-id-hint" className="mt-1.5 text-xs leading-5 text-slate-500">Digits only, as shown in your Meta WhatsApp configuration.</p>}
+              </div>
+              <div>
+                <label htmlFor="whatsapp-display-number" className="text-sm font-medium text-slate-800">Display phone number (optional)</label>
+                <input
+                  id="whatsapp-display-number"
+                  name="displayNumber"
+                  type="tel"
+                  autoComplete="tel"
+                  maxLength={16}
+                  placeholder="+919876543210"
+                  value={whatsappDisplayNumber}
+                  onChange={(event) => {
+                    setWhatsappDisplayNumber(event.target.value)
+                    setWhatsappDisplayNumberError(null)
+                    setWhatsappError(null)
+                    setWhatsappSuccess(null)
+                  }}
+                  aria-invalid={Boolean(whatsappDisplayNumberError)}
+                  aria-describedby={whatsappDisplayNumberError ? 'whatsapp-display-number-error' : 'whatsapp-display-number-hint'}
+                  className={`${inputClassName} ${whatsappDisplayNumberError ? 'border-rose-400 focus:border-rose-500 focus:ring-rose-500/10' : ''}`}
+                />
+                {whatsappDisplayNumberError
+                  ? <p id="whatsapp-display-number-error" className="mt-1.5 text-xs text-rose-700">{whatsappDisplayNumberError}</p>
+                  : <p id="whatsapp-display-number-hint" className="mt-1.5 text-xs leading-5 text-slate-500">International format, for example +919876543210. Leave blank to keep the saved display number.</p>}
+              </div>
+            </div>
+
+            {whatsappError && <div role="alert" aria-live="polite" className="rounded-xl bg-rose-50 px-4 py-3 text-sm text-rose-800">{whatsappError}</div>}
+            {whatsappSuccess && <div role="status" aria-live="polite" className="rounded-xl bg-emerald-50 px-4 py-3 text-sm text-emerald-800">{whatsappSuccess}</div>}
+
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <p className="max-w-2xl text-xs leading-5 text-slate-500">
+                Saving this ID records configuration only. It does not verify Meta connectivity or send a message.
+              </p>
+              <button
+                type="submit"
+                disabled={whatsappSaving || !whatsappPhoneNumberId.trim()}
+                className="shrink-0 rounded-xl bg-emerald-700 px-5 py-3 text-sm font-semibold text-white outline-none transition hover:bg-emerald-800 focus-visible:ring-2 focus-visible:ring-emerald-600 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {whatsappSaving ? 'Saving…' : 'Save WhatsApp settings'}
+              </button>
+            </div>
+          </form>
+        )}
+      </section>
     </div>
   )
 }

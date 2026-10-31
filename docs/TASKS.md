@@ -1,5 +1,18 @@
 # Development Tasks
 
+## Progress status and verification
+
+Checkboxes below describe implementation status. They do not imply browser testing or live external integration.
+
+| Verification type | Current evidence |
+|---|---|
+| Typecheck/build | Recent frontend and backend typechecks and production builds passed during Steps 5.8–5.9. |
+| Mocked/isolated checks | Status ingestion/transitions and WhatsApp number validation/safe serialization checks are reported as passed. These do not cover every API path. |
+| Browser testing | Phase 4 management API/UI manual testing is reported by the project team. Phase 5 inbox/status refresh and WhatsApp settings browser verification are not recorded as complete. |
+| Live Atlas/Meta/WhatsApp | Not verified as a complete live integration. Code presence and mock checks are not live provider evidence. |
+
+There is no repeatable project-wide automated test suite configured yet.
+
 ## Completed documentation and foundation work
 
 - [x] Inspect repository structure, `.gitignore`, Git history, and status.
@@ -9,8 +22,12 @@
 - [x] Configure MongoDB/Mongoose connection and implement User and Business models, registration, login, JWT authentication, and frontend auth/session handling.
 - [x] Implement CatalogItem and FAQ models with business-scoped APIs.
 - [x] Implement authenticated Business Profile, catalog, and FAQ management APIs and frontend pages; catalog listing includes pagination.
+- [x] Implement Customer, Conversation, and Message models with business-scoped indexes.
+- [x] Implement paginated conversation/history APIs and the authenticated frontend inbox, older-history loading, manual text composer, status labels, and manual history refresh.
+- [x] Implement optional Meta configuration, WhatsApp webhook verification/signature checks, incoming text ingestion, manual outgoing text messaging, and delivery/read/failure status processing.
+- [x] Add authenticated WhatsApp Phone Number ID/display-number configuration and safe failure-detail serialization/display.
 
-Completed items above reflect code present in the repository. Manual verification of Phase 4 APIs/UI is reported by the project team. Automated tests and external WhatsApp/Gemini integrations are not implied by these checkmarks.
+Completed items reflect code present in the repository. Meta/WhatsApp provider setup, live delivery, browser verification of Phase 5 flows, and Gemini integration are not implied by these checkmarks.
 
 ## Pending — Decisions and planning follow-up
 
@@ -27,7 +44,6 @@ Completed items above reflect code present in the repository. Manual verificatio
 
 ### Foundations, database, and authentication
 
-- [ ] Implement Mongoose models for customers, conversations, and messages, with reviewed indexes and parent/child ownership validation.
 - [ ] Confirm production secret provisioning and deployment configuration; do not commit credentials.
 - [ ] Add cross-business authorization tests.
 
@@ -35,21 +51,17 @@ Completed items above reflect code present in the repository. Manual verificatio
 
 - [ ] Implement AI settings and communication preference APIs/screens after their behavior is approved.
 - [ ] Decide whether deactivated catalog items and FAQs need an owner-facing reactivation workflow; current APIs support soft deactivation but not reactivation.
-- [ ] Implement customer list, conversation inbox, and paginated message history.
-- [ ] Show owner-visible message processing and error states.
+- [ ] Browser-test the inbox, pagination, composer, status refresh, and safe failure display.
 - [ ] Add customer data deletion flow after retention/deletion policy is approved.
 
 ### WhatsApp and message processing
 
-- [ ] Implement GET webhook challenge verification and raw-body POST signature verification.
-- [ ] Normalize inbound messages and delivery-status events; handle malformed/unsupported events safely.
-- [ ] Create/retrieve customers and reuse/create conversations according to agreed lifecycle rules.
-- [ ] Enforce provider-message idempotency and test duplicate webhook deliveries.
-- [ ] Implement owner outbound messages and delivery-status synchronization.
-- [ ] Persist processing status, retry count, timestamps, and sanitized error details.
-- [ ] Implement bounded AI retry and owner-initiated manual retry.
-- [ ] Recover stale pending work best-effort; represent ambiguous sends as unknown and do not blindly resend.
-- [ ] Test owner-visible processing and owner-visible failure states.
+- [ ] Configure the authorized Meta app, WABA subscription, public HTTPS callback, backend credentials, and business Phone Number ID securely.
+- [ ] Confirm the currently supported Graph API version and applicable Meta messaging policies before sending.
+- [ ] Complete live webhook verification and controlled inbound text/status testing with an approved test number.
+- [ ] Complete one controlled outbound send and confirm provider status/history. Do not retry ambiguous outcomes blindly.
+- [ ] Add a repeatable webhook/API test suite and live-test evidence record.
+- [ ] Decide whether a secure disconnect/clear-number operation is needed; current number configuration does not provide one.
 
 ### Gemini, takeover, verification, and deployment
 
@@ -58,10 +70,14 @@ Completed items above reflect code present in the repository. Manual verificatio
 - [ ] Add AI grounding tests and unknown-information handling tests.
 - [ ] Test invented price, stock, discount, and policy prevention; add prompt-injection tests.
 - [ ] Validate Gemini response and make provider failures visible without claiming send success.
+- [ ] Implement AI settings and communication preference APIs/screens after their behavior is approved.
 - [ ] Implement atomic MongoDB coordination for takeover request, dispatch claim, mode update, and resume.
 - [ ] Add human takeover race tests for generation and in-flight send.
-- [ ] Add unit/API/webhook/integration/end-to-end tests using mocks and authorized non-production accounts.
-- [ ] Deploy to Vercel/Render with Atlas only after account/secret configuration; verify complete flow and document demo evidence.
+- [ ] Add repeatable unit/API/webhook/integration/end-to-end tests using mocks and authorized non-production accounts.
+- [ ] Complete browser verification of login/session restoration, management screens, inbox, manual refresh, and logout.
+- [ ] Verify the live Atlas transaction path and business-scoped behavior in the target environment.
+- [ ] Deploy to Vercel/Render only after account/secret configuration; set production `VITE_API_BASE_URL` and `FRONTEND_ORIGIN` correctly.
+- [ ] Verify live HTTPS webhook, inbound/outbound WhatsApp, status history, safe rollback, and document evidence before marking end-to-end complete.
 
 ## Deferred to semester four — not current implementation tasks
 

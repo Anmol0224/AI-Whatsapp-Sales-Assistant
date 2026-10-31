@@ -64,6 +64,24 @@ export type BusinessProfileUpdate = {
   timezone?: string
 }
 
+export type BusinessWhatsAppConnectionStatus = 'not_configured' | 'configured_not_verified'
+
+export type BusinessWhatsAppSettings = {
+  phoneNumberId?: string
+  displayNumber?: string
+  connectionStatus: BusinessWhatsAppConnectionStatus
+}
+
+export type BusinessWhatsAppSettingsResponse = {
+  success: true
+  whatsapp: BusinessWhatsAppSettings
+}
+
+export type BusinessWhatsAppSettingsUpdate = {
+  phoneNumberId: string
+  displayNumber?: string
+}
+
 export type CatalogItemKind = 'product' | 'service'
 
 export type CatalogItem = {
@@ -151,6 +169,59 @@ export type FaqUpdateData = Partial<FaqCreateData>
 
 export type FaqFilters = {
   isActive?: boolean
+}
+
+export type InboxConversation = {
+  id: string
+  customer?: {
+    profileName?: string
+    phoneNumber?: string
+  }
+  status: 'open' | 'closed'
+  lastMessagePreview?: string
+  lastActivityAt: string
+}
+
+export type InboxMessage = {
+  id: string
+  direction: 'inbound' | 'outbound'
+  messageType: 'text'
+  text: string
+  status: 'received' | 'sent' | 'delivered' | 'read' | 'failed'
+  providerErrorCode?: string
+  providerErrorTitle?: string
+  timestamp?: string
+  createdAt: string
+}
+
+export type ConversationListResponse = {
+  success: true
+  conversations: InboxConversation[]
+  pagination: CatalogPagination
+}
+
+export type ConversationMessagesResponse = {
+  success: true
+  messages: InboxMessage[]
+  pagination: CatalogPagination
+}
+
+export type SentConversationMessage = InboxMessage & {
+  conversationId: string
+  customerId: string
+  providerMessageId: string
+  updatedAt: string
+}
+
+export type SendConversationMessageResponse = {
+  success: true
+  message: string
+  data: { message: SentConversationMessage }
+}
+
+export type ConversationFilters = {
+  page?: number
+  limit?: number
 }
 
 export class ApiError extends Error {
@@ -267,6 +338,19 @@ function isBusinessProfileResponse(value: unknown): value is BusinessProfileResp
   return isRecord(value) && value.success === true && isBusinessProfile(value.business)
 }
 
+function isBusinessWhatsAppSettings(value: unknown): value is BusinessWhatsAppSettings {
+  return (
+    isRecord(value) &&
+    (value.phoneNumberId === undefined || typeof value.phoneNumberId === 'string') &&
+    (value.displayNumber === undefined || typeof value.displayNumber === 'string') &&
+    (value.connectionStatus === 'not_configured' || value.connectionStatus === 'configured_not_verified')
+  )
+}
+
+function isBusinessWhatsAppSettingsResponse(value: unknown): value is BusinessWhatsAppSettingsResponse {
+  return isRecord(value) && value.success === true && isBusinessWhatsAppSettings(value.whatsapp)
+}
+
 function isDateString(value: unknown): value is string {
   return typeof value === 'string' && Number.isFinite(Date.parse(value))
 }
@@ -365,6 +449,81 @@ function isFaqsResponse(value: unknown): value is FaqsResponse {
     value.success === true &&
     Array.isArray(value.faqs) &&
     value.faqs.every(isFaq)
+  )
+}
+
+function isInboxConversation(value: unknown): value is InboxConversation {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== 'string' ||
+    (value.status !== 'open' && value.status !== 'closed') ||
+    (value.lastMessagePreview !== undefined && typeof value.lastMessagePreview !== 'string') ||
+    !isDateString(value.lastActivityAt)
+  ) {
+    return false
+  }
+
+  if (value.customer === undefined) return true
+  return (
+    isRecord(value.customer) &&
+    (value.customer.profileName === undefined || typeof value.customer.profileName === 'string') &&
+    (value.customer.phoneNumber === undefined || typeof value.customer.phoneNumber === 'string')
+  )
+}
+
+function isInboxMessage(value: unknown): value is InboxMessage {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    (value.direction === 'inbound' || value.direction === 'outbound') &&
+    value.messageType === 'text' &&
+    typeof value.text === 'string' &&
+    ['received', 'sent', 'delivered', 'read', 'failed'].includes(String(value.status)) &&
+    (value.providerErrorCode === undefined || (typeof value.providerErrorCode === 'string' && value.providerErrorCode.length <= 64)) &&
+    (value.providerErrorTitle === undefined || (typeof value.providerErrorTitle === 'string' && value.providerErrorTitle.length <= 200)) &&
+    (value.timestamp === undefined || isDateString(value.timestamp)) &&
+    isDateString(value.createdAt)
+  )
+}
+
+function isConversationListResponse(value: unknown): value is ConversationListResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    Array.isArray(value.conversations) &&
+    value.conversations.every(isInboxConversation) &&
+    isCatalogPagination(value.pagination)
+  )
+}
+
+function isConversationMessagesResponse(value: unknown): value is ConversationMessagesResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    Array.isArray(value.messages) &&
+    value.messages.every(isInboxMessage) &&
+    isCatalogPagination(value.pagination)
+  )
+}
+
+function isSentConversationMessage(value: unknown): value is SentConversationMessage {
+  return (
+    isRecord(value) &&
+    typeof value.conversationId === 'string' &&
+    typeof value.customerId === 'string' &&
+    typeof value.providerMessageId === 'string' &&
+    isDateString(value.updatedAt) &&
+    isInboxMessage(value)
+  )
+}
+
+function isSendConversationMessageResponse(value: unknown): value is SendConversationMessageResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    typeof value.message === 'string' &&
+    isRecord(value.data) &&
+    isSentConversationMessage(value.data.message)
   )
 }
 
@@ -485,6 +644,21 @@ export function updateBusinessProfile(
   )
 }
 
+export function getBusinessWhatsAppSettings(): Promise<BusinessWhatsAppSettingsResponse> {
+  return requestJson('/business/whatsapp', isBusinessWhatsAppSettingsResponse, {}, true)
+}
+
+export function updateBusinessWhatsAppSettings(
+  data: BusinessWhatsAppSettingsUpdate,
+): Promise<BusinessWhatsAppSettingsResponse> {
+  return requestJson(
+    '/business/whatsapp',
+    isBusinessWhatsAppSettingsResponse,
+    { method: 'PATCH', body: JSON.stringify(data) },
+    true,
+  )
+}
+
 function buildQuery(path: string, values: Record<string, string | number | boolean | undefined>): string {
   const params = new URLSearchParams()
   for (const [key, value] of Object.entries(values)) {
@@ -565,6 +739,39 @@ export function deactivateFaq(id: string): Promise<FaqDeactivationResponse> {
     `/faqs/${encodeURIComponent(id)}`,
     isFaqDeactivationResponse,
     { method: 'DELETE' },
+    true,
+  )
+}
+
+export function getConversations(
+  filters: ConversationFilters = {},
+): Promise<ConversationListResponse> {
+  const path = buildQuery('/conversations', {
+    page: filters.page,
+    limit: filters.limit,
+  })
+  return requestJson(path, isConversationListResponse, {}, true)
+}
+
+export function getConversationMessages(
+  conversationId: string,
+  filters: ConversationFilters = {},
+): Promise<ConversationMessagesResponse> {
+  const path = buildQuery(`/conversations/${encodeURIComponent(conversationId)}/messages`, {
+    page: filters.page,
+    limit: filters.limit,
+  })
+  return requestJson(path, isConversationMessagesResponse, {}, true)
+}
+
+export function sendConversationMessage(
+  conversationId: string,
+  text: string,
+): Promise<SendConversationMessageResponse> {
+  return requestJson(
+    `/conversations/${encodeURIComponent(conversationId)}/messages`,
+    isSendConversationMessageResponse,
+    { method: 'POST', body: JSON.stringify({ text }) },
     true,
   )
 }

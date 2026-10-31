@@ -16,6 +16,13 @@ function toJwtExpirySeconds(value: string): number {
   return Number(value.slice(0, -1)) * jwtExpiryMultipliers[unit];
 }
 
+function optionalSetting<T extends z.ZodType>(schema: T) {
+  return z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    schema.optional(),
+  );
+}
+
 const environmentSchema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   PORT: z.coerce.number().int().min(1).max(65535).default(5000),
@@ -47,6 +54,33 @@ const environmentSchema = z.object({
       message: "must be an origin URL without a path",
     })
     .default("http://localhost:5173"),
+  META_GRAPH_API_VERSION: z.preprocess(
+    (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+    z
+      .string()
+      .trim()
+      .regex(/^v\d+\.\d+$/, "must use the version format vNN.N, for example v26.0")
+      .default("v26.0"),
+  ),
+  WHATSAPP_ACCESS_TOKEN: optionalSetting(
+    z
+      .string()
+      .trim()
+      .min(1)
+      .max(8192)
+      .regex(/^\S+$/, "must not contain whitespace"),
+  ),
+  WHATSAPP_VERIFY_TOKEN: optionalSetting(
+    z
+      .string()
+      .trim()
+      .min(32, "must be at least 32 characters long")
+      .max(256)
+      .regex(/^[A-Za-z0-9._~-]+$/, "must contain only letters, numbers, dots, underscores, tildes, or hyphens"),
+  ),
+  META_APP_SECRET: optionalSetting(
+    z.string().trim().regex(/^[a-fA-F0-9]{32}$/, "must be a 32-character hexadecimal value"),
+  ),
 });
 
 const parsedEnvironment = environmentSchema.safeParse(process.env);

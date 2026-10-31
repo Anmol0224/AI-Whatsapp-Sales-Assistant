@@ -5,11 +5,13 @@ import { BusinessProfilePage } from './pages/BusinessProfilePage'
 import { CatalogPage } from './pages/CatalogPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { FaqsPage } from './pages/FaqsPage'
+import { InboxPage } from './pages/InboxPage'
 import { LoginPage } from './pages/LoginPage'
 import { RegisterPage } from './pages/RegisterPage'
 
 const dashboardRoutes = {
   '/dashboard': { title: 'Overview' },
+  '/dashboard/inbox': { title: 'Inbox' },
   '/dashboard/business': { title: 'Business Profile' },
   '/dashboard/catalog': { title: 'Products & Services' },
   '/dashboard/faqs': { title: 'FAQs' },
@@ -79,6 +81,8 @@ function AppContent() {
 
     if (routePath === '/dashboard/business') {
       page = <BusinessProfilePage />
+    } else if (routePath === '/dashboard/inbox') {
+      page = <InboxPage />
     } else if (routePath === '/dashboard/catalog') {
       page = <CatalogPage />
     } else if (routePath === '/dashboard/faqs') {

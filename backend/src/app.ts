@@ -7,8 +7,10 @@ import errorHandler from "./middleware/error-handler.js";
 import authRouter from "./routes/v1/auth.routes.js";
 import businessRouter from "./routes/v1/business.routes.js";
 import catalogItemsRouter from "./routes/v1/catalog-items.routes.js";
+import conversationsRouter from "./routes/v1/conversations.routes.js";
 import faqsRouter from "./routes/v1/faqs.routes.js";
 import healthRouter from "./routes/v1/health.routes.js";
+import whatsappWebhookRouter from "./routes/v1/whatsapp-webhook.routes.js";
 
 const app = express();
 
@@ -34,12 +36,37 @@ const apiRateLimiter = rateLimit({
   },
 });
 
+function rejectCompressedWebhookBodies(
+  request: express.Request,
+  response: express.Response,
+  next: express.NextFunction,
+): void {
+  const contentEncoding = request.get("content-encoding");
+  if (contentEncoding && contentEncoding.toLowerCase() !== "identity") {
+    response.status(415).json({
+      success: false,
+      message: "Compressed webhook request bodies are not supported.",
+    });
+    return;
+  }
+
+  next();
+}
+
 app.use(helmet());
 app.use(cors(corsOptions));
+app.use(
+  "/api/v1/webhooks/whatsapp",
+  apiRateLimiter,
+  rejectCompressedWebhookBodies,
+  express.raw({ type: "application/json", limit: "100kb", inflate: false }),
+  whatsappWebhookRouter,
+);
 app.use(express.json({ limit: "100kb" }));
 app.use("/api/v1/auth", apiRateLimiter, authRouter);
 app.use("/api/v1/business", apiRateLimiter, businessRouter);
 app.use("/api/v1/catalog-items", apiRateLimiter, catalogItemsRouter);
+app.use("/api/v1/conversations", apiRateLimiter, conversationsRouter);
 app.use("/api/v1/faqs", apiRateLimiter, faqsRouter);
 app.use("/api/v1", apiRateLimiter, healthRouter);
 

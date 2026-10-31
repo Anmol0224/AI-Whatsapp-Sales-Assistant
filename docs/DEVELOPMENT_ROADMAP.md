@@ -2,11 +2,26 @@
 
 ## Status and schedule
 
-This is the planned sequence and estimate, reconciled with the current implementation. Phases 1–3 foundations/authentication are implemented. The Phase 4 business profile, catalog, and FAQ APIs and management screens are implemented and were manually tested by the project team. Phase 4 AI settings/communication preferences and automated test coverage remain pending. Phases 5–9 remain planned; provider setup and deployment are not assumed complete. The original 13–16 week estimate is a planning estimate, not a completed schedule.
+This is the planned sequence and estimate, reconciled with source and recorded verification. Implementation work for Phases 1–6 is present in the repository; acceptance evidence varies by phase. Gemini/AI behavior and human takeover (Phases 7–8) and deployment/final acceptance (Phase 9) remain pending. Code presence, mock checks, browser testing, and live provider verification are tracked separately below. External accounts and production configuration are not assumed complete. The original 13–16 week estimate is a planning estimate, not a completed schedule.
+
+### Progress and verification summary
+
+| Area | Implementation status | Verification evidence |
+|---|---|---|
+| Project foundation, auth, profile, catalog, FAQ | Implemented. | Recent typechecks/builds passed; Phase 4 API/UI manual verification was reported by the project team. |
+| Conversation/message models and APIs; inbox/composer/history refresh | Implemented. | Recent frontend/backend typechecks and builds passed. Phase 5 browser testing is not recorded as verified. |
+| Webhook verification, incoming text ingestion, outgoing text service/API, delivery/read/failure statuses | Implemented in source. | Isolated/mock ingestion and status-transition checks passed; no live Meta callback or WhatsApp send/receive is verified. |
+| WhatsApp number configuration and safe failure-detail display | Implemented in source. | Step 5.9.2/5.9.4 typechecks/builds passed; isolated schema/serialization checks passed. No live number verification exists. |
+| Gemini response generation and human takeover/resume | Not implemented. | Not tested. |
+| Atlas/Meta/WhatsApp production end-to-end flow | Pending live verification. | Not verified by recent implementation checks. |
+
+The repository does not currently provide a repeatable project-wide automated test suite. “Mock-tested” above refers only to the isolated checks stated; it does not mean all APIs or external integrations have been tested.
 
 ## Phases
 
 ### Phase 1 — Architecture and planning (about 1 week)
+
+- **Status:** Planning documents are present and have been reconciled with current implementation status; outstanding AI and live-integration decisions remain open.
 
 - **Objective:** Agree Version 1.0 scope, data contracts, safety behavior, and unresolved decisions.
 - **Dependencies:** Project requirements and team review.
@@ -16,6 +31,8 @@ This is the planned sequence and estimate, reconciled with the current implement
 
 ### Phase 2 — Project foundations (about 1 week)
 
+- **Status:** Implemented: React/Vite/TypeScript frontend, Express/TypeScript backend, validated backend environment configuration, security middleware, health API, and frontend/backend API client communication.
+
 - **Objective:** Establish a small maintainable frontend/backend development setup.
 - **Dependencies:** Phase 1; selected runtime/tool versions.
 - **Work items:** Frontend and backend setup, configuration strategy, safe secret handling, basic error handling, linting and formatting.
@@ -24,7 +41,7 @@ This is the planned sequence and estimate, reconciled with the current implement
 
 ### Phase 3 — Database and authentication (about 2 weeks)
 
-- **Status:** Implemented for the current foundation: MongoDB connection/configuration; User and Business models; registration, login, JWT middleware; and authenticated frontend flows. CatalogItem and FAQ models were added in Phase 4. Customer, Conversation, and Message models, automated isolation tests, and several planned data workflows remain pending.
+- **Status:** Implemented: MongoDB/Mongoose connection, User and Business models, registration/login/JWT, and authenticated frontend flows. Customer, Conversation, and Message models were added with the messaging work. A repeatable automated auth/isolation suite remains pending.
 
 - **Objective:** Persist core data and protect owner access.
 - **Dependencies:** Phase 2; MongoDB development connection; approved token design.
@@ -34,7 +51,7 @@ This is the planned sequence and estimate, reconciled with the current implement
 
 ### Phase 4 — Business configuration (about 1–2 weeks)
 
-- **Status:** Business profile, catalog, and FAQ APIs and frontend management pages are implemented. Catalog listing supports pagination. Manual testing is reported by the project team; automated tests are still pending. AI settings and communication preferences are not implemented.
+- **Status:** Implemented: business profile, catalog and FAQ APIs/pages, including catalog pagination. Phase 4 API/UI manual testing is reported by the project team. Automated regression tests, AI settings, and communication preferences remain pending.
 
 - **Objective:** Let the owner maintain business facts for the future AI response flow.
 - **Dependencies:** Phase 3.
@@ -44,19 +61,23 @@ This is the planned sequence and estimate, reconciled with the current implement
 
 ### Phase 5 — Inbox and messaging UI (about 2 weeks)
 
-- **Objective:** Build the owner-facing customer/inbox/history experience before live messaging.
+- **Status:** Implemented: conversation list/history APIs, pagination, frontend inbox, older-history loading, owner text composer, status labels, failed-message title display, and manual history refresh. Typechecks/builds passed in recent steps; browser verification is not recorded as complete.
+
+- **Objective:** Provide an owner-facing customer inbox/history and manual message interface.
 - **Dependencies:** Phase 3; basic UI patterns from Phase 2.
-- **Work items:** Customer list, conversation list/details, message history and pagination, processing/error status display, simulated messages for frontend/backend testing.
-- **Acceptance criteria:** Simulated inbound/outbound data appears in correct order; owner can inspect status; pagination and business isolation work.
-- **Deliverables:** Inbox/dashboard screens, conversation APIs, test fixtures or development-only simulated events.
+- **Work items:** Conversation list/details, message history and pagination, status/error display, and owner-triggered text sending.
+- **Acceptance criteria:** Implemented in source; browser and live end-to-end acceptance remain to be recorded.
+- **Deliverables:** Inbox/dashboard screens, conversation APIs, manual composer.
 
 ### Phase 6 — WhatsApp integration (about 2–3 weeks)
+
+- **Status:** Integration code is implemented: optional backend Meta configuration, safe business Phone Number ID settings, GET challenge and POST signature verification, incoming text ingestion, outgoing text send, and status processing. Meta/WhatsApp live setup and verification remain pending.
 
 - **Objective:** Receive and send messages using an authorized Meta test setup.
 - **Dependencies:** Phase 5; Meta app/number, credentials, public HTTPS URL; current Meta requirements reviewed.
 - **Work items:** Secure configuration, GET challenge, raw-body POST signature validation, payload normalization, customer/conversation creation, duplicate handling, outbound text sends, delivery-status events.
-- **Acceptance criteria:** Test webhook verification succeeds; duplicate event creates one message; test number receives a controlled inbound and outbound message; statuses are reflected; failures are visible.
-- **Deliverables:** WhatsApp adapter and tested webhook/send flows. If Meta access is unavailable, document as blocked external dependency rather than completed.
+- **Acceptance criteria:** Mock/isolated status checks are reported as passed. Live webhook verification, controlled inbound/outbound test messages, provider status reflection, and failure behavior remain pending.
+- **Deliverables:** WhatsApp adapter and a future authorized live test record. Do not mark external integration complete until verified.
 
 ### Phase 7 — Gemini integration (about 2 weeks)
 
@@ -84,7 +105,7 @@ This is the planned sequence and estimate, reconciled with the current implement
 
 ## Testing strategy
 
-The following is the continuing test plan. Typecheck/build checks and manual API/UI verification have been run during implementation as reported by the project team. A repeatable automated test suite is not yet present in the repository.
+The following is the continuing test plan. Recent frontend/backend typechecks and production builds passed. Isolated mocked status-ingestion and number-configuration checks are reported as passed. Phase 4 manual testing is reported by the project team; Phase 5 browser verification and all live provider checks remain unverified. A repeatable automated test suite is not yet present in the repository.
 
 - Use Postman for manual REST/auth/webhook-path exploration and appropriate automated unit/API/integration tests for repeatable checks.
 - Unit-test validation, integer-paise handling, authorization, prompt assembly, webhook normalization, deduplication, state transitions, and retry eligibility.

@@ -14,6 +14,11 @@ const profileProjection = {
   "contactDetails.address": 1,
   timezone: 1,
 };
+const whatsappProjection = {
+  "whatsapp.phoneNumberId": 1,
+  "whatsapp.displayNumber": 1,
+  "whatsapp.connectionStatus": 1,
+};
 
 function isValidTimezone(value: string): boolean {
   try {
@@ -55,6 +60,19 @@ const profilePatchSchema = z
     message: "Provide at least one profile field to update.",
   });
 
+const whatsappSettingsPatchSchema = z
+  .object({
+    phoneNumberId: z.string().trim().min(1).max(32).regex(/^\d+$/),
+    displayNumber: z
+      .string()
+      .trim()
+      .min(1)
+      .max(16)
+      .regex(/^\+?[1-9]\d{6,14}$/)
+      .optional(),
+  })
+  .strict();
+
 function validationErrors(issues: z.ZodIssue[]) {
   return issues.map((issue) => ({
     field: issue.path.join("."),
@@ -91,6 +109,23 @@ function safeBusinessProfile(business: {
     },
     timezone: business.timezone,
   };
+}
+
+function safeWhatsAppSettings(business: {
+  whatsapp?: {
+    phoneNumberId?: string;
+    displayNumber?: string;
+    connectionStatus?: string;
+  };
+}) {
+  const phoneNumberId = business.whatsapp?.phoneNumberId?.trim() || undefined;
+  const displayNumber = business.whatsapp?.displayNumber?.trim() || undefined;
+
+  // This application has no Meta verification flow yet, so a saved ID must
+  // never be presented as a live connection.
+  const connectionStatus = phoneNumberId ? "configured_not_verified" : "not_configured";
+
+  return { phoneNumberId, displayNumber, connectionStatus };
 }
 
 businessRouter.use(authenticate);
@@ -168,6 +203,78 @@ businessRouter.patch("/", async (request, response, next) => {
     response.status(200).json({
       success: true,
       business: safeBusinessProfile(business),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+businessRouter.get("/whatsapp", async (request, response, next) => {
+  const auth = request.auth;
+  if (!auth) {
+    response.status(401).json({ success: false, message: "Authentication required." });
+    return;
+  }
+
+  try {
+    const business = await Business.findOne({
+      _id: auth.businessId,
+      ownerUserId: auth.userId,
+    }).select(whatsappProjection);
+
+    if (!business) {
+      response.status(404).json({ success: false, message: "Business not found." });
+      return;
+    }
+
+    response.status(200).json({
+      success: true,
+      whatsapp: safeWhatsAppSettings(business),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+businessRouter.patch("/whatsapp", async (request, response, next) => {
+  const auth = request.auth;
+  if (!auth) {
+    response.status(401).json({ success: false, message: "Authentication required." });
+    return;
+  }
+
+  const parsedBody = whatsappSettingsPatchSchema.safeParse(request.body);
+  if (!parsedBody.success) {
+    response.status(400).json({
+      success: false,
+      message: "Invalid WhatsApp number configuration.",
+      errors: validationErrors(parsedBody.error.issues),
+    });
+    return;
+  }
+
+  const { phoneNumberId, displayNumber } = parsedBody.data;
+  const updates: Record<string, string> = {
+    "whatsapp.phoneNumberId": phoneNumberId,
+    "whatsapp.connectionStatus": "configured_not_verified",
+  };
+  if (displayNumber !== undefined) updates["whatsapp.displayNumber"] = displayNumber;
+
+  try {
+    const business = await Business.findOneAndUpdate(
+      { _id: auth.businessId, ownerUserId: auth.userId },
+      { $set: updates },
+      { new: true, runValidators: true },
+    ).select(whatsappProjection);
+
+    if (!business) {
+      response.status(404).json({ success: false, message: "Business not found." });
+      return;
+    }
+
+    response.status(200).json({
+      success: true,
+      whatsapp: safeWhatsAppSettings(business),
     });
   } catch (error) {
     next(error);

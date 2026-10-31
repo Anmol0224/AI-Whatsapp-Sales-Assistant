@@ -2,9 +2,9 @@
 
 ## Introduction
 
-The AI-Powered WhatsApp Sales Assistant is a planned web application for small business owners. It will help an owner manage business information and respond to customer enquiries arriving at one connected WhatsApp Business number. The backend will use the owner's profile, active products and services, FAQs, and recent conversation messages as context for Google Gemini, then send an appropriate reply through Meta's WhatsApp Cloud API when the conversation is in AI mode.
+The AI-Powered WhatsApp Sales Assistant is a web application for small business owners. The current implementation supports account access, business information management, and a manual WhatsApp inbox for one business workspace with a stored number configuration. Owners can review incoming messages and send text replies through Meta's WhatsApp Cloud API when the external account and credentials are configured.
 
-This repository is at the planning stage. These documents describe proposed functionality; they do not mean any application, database, API, AI model, or external integration has been implemented or configured.
+Google Gemini responses, AI context retrieval, and AI/human takeover controls remain planned. WhatsApp configuration and messaging code do not mean that a Meta account, public webhook, credentials, or live delivery has been configured or tested.
 
 ## Business problem and value proposition
 
@@ -14,34 +14,37 @@ The intended value is improved customer engagement and more opportunities to con
 
 ## Target users
 
-- **Primary user:** One business owner per workspace, who registers, configures business information, reviews conversations, and takes over when needed.
+- **Primary user:** One business owner per workspace, who registers, configures business information, reviews conversations, and can send manual replies. Automated AI/human takeover controls remain planned.
 - **Customer:** A person enquiring through the business's WhatsApp number. Customers do not log into this application.
 - **Future extension:** Operator accounts may be considered later, but are not part of the current one-owner-per-workspace MVP.
 
-## How personalized responses work
+## Planned AI response behavior
 
-For an eligible inbound message, the backend will collect the latest customer message, business name and description, relevant active products/services and FAQs, communication preferences, and a bounded window of roughly 10–15 recent conversation messages (subject to model context limits). Gemini is an existing large language model used with this context; the project does not train its own model. The prompt will require the model to use only supplied facts, ask for clarification when needed, and offer human assistance when it cannot answer safely.
+If AI responses are implemented, the backend would collect the latest customer message, business name and description, relevant active products/services and FAQs, communication preferences, and a bounded window of roughly 10–15 recent conversation messages (subject to model context limits). Gemini is an existing large language model; this project does not train its own model. A future prompt would require the model to use only supplied facts, ask for clarification when needed, and offer human assistance when it cannot answer safely.
 
-Conversation context helps resolve references such as “the larger one” or “is that still available?” without treating every new message as an isolated question. Only bounded context needed for the reply should be sent to the provider.
+If implemented, conversation context could help resolve references such as “the larger one” or “is that still available?” without treating every new message as an isolated question. Only bounded context needed for a reply should be sent to the provider.
 
 The system must not invent prices, stock availability, discounts, or policies. If information is missing or Gemini is unavailable, the failure should be visible to the owner and the system must not claim an AI reply was delivered. Whether a fallback clarification is automatically sent or the owner must respond is an open decision.
 
 ## Third-semester deliverables — Version 1.0
 
-- Owner registration and login using JWT and bcrypt.
-- One owner and one business workspace per owner.
-- Business profile configuration, AI settings, and communication preferences.
-- Product/service and FAQ management.
-- One connected WhatsApp Business number per workspace.
-- Meta webhook verification and incoming WhatsApp message processing.
-- Automatic customer record creation/retrieval.
-- Conversation and message persistence in MongoDB.
-- Gemini responses grounded in business-specific information and recent messages.
-- Owner dashboard, customer list, chat inbox, and paginated message history.
-- Human takeover and resume-AI controls.
-- Error handling, bounded retry/recovery behavior, and owner-visible processing/delivery states.
+Implemented in source:
 
-Every item is planned. External accounts, credentials, and integrations are not assumed to exist.
+- Owner registration/login using JWT and bcrypt; one owner and one business workspace.
+- Business profile, product/service, and FAQ management.
+- Configuration of one Phone Number ID and display number per business. The API reports `configured_not_verified` until a verification flow exists.
+- Meta webhook challenge verification and raw-body signature verification.
+- Incoming text-message persistence with customer/conversation reuse and provider-message deduplication.
+- Manual owner-initiated outgoing text messages, conversation listing, paginated history, and a frontend inbox/composer.
+- Delivery/read/failure status processing and safe optional failure-detail display after history refresh.
+
+Not implemented or not verified live:
+
+- Gemini responses, business-context retrieval, AI settings, and human takeover/resume controls.
+- Live Meta webhook verification, real WhatsApp receiving/delivery, and deployed end-to-end testing.
+- Automated AI retry/recovery and a repeatable project-wide automated test suite.
+
+The code implementation is present, but external accounts, credentials, deployment, and live integration are not implied.
 
 ## Fourth-semester future scope — Version 2.0, deferred
 
@@ -57,4 +60,4 @@ These features are excluded from the current semester's implementation. The arch
 
 ## Current repository status
 
-At inspection, the repository contains the initial Git setup, `.gitignore`, and planning documents only. No application feature, API, database, provider integration, deployment, or automated test has been completed.
+The repository contains frontend and backend application code, Mongoose models, authentication and business APIs, WhatsApp webhook and manual text-send code, and the inbox UI. Recent implementation steps report passing typechecks and production builds, plus isolated mocked checks for status processing and WhatsApp number configuration. Browser verification of the inbox/number settings and live Atlas/Meta/WhatsApp end-to-end verification remain unconfirmed or pending; no repeatable automated test suite is configured.

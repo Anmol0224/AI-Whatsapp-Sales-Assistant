@@ -2,7 +2,7 @@
 
 ## Status and conventions
 
-This document describes the backend routes currently implemented. Future WhatsApp, Gemini, inbox, and conversation APIs are intentionally omitted until they exist. The API base path is `/api/v1`; requests and responses use JSON.
+This document describes the backend routes currently implemented. The API base path is `/api/v1`; application requests and responses use JSON. WhatsApp webhook callbacks are the exception: verification returns plain text, and POST callbacks are authenticated by Meta's raw-body signature rather than JWT. Gemini responses and delivery-triggered real-time frontend refresh are not implemented.
 
 Protected endpoints require `Authorization: Bearer <JWT>`. The backend derives the business scope from verified JWT claims and does not authorize using a client-supplied business ID. Successful resource responses use `{ "success": true, ... }`. Error responses use `{ "success": false, "message": "...", "errors": [...] }` when field details are available. Errors do not include stack traces or internal credentials.
 
@@ -83,6 +83,41 @@ PATCH accepts any non-empty subset of `name`, `description`, `industry`, `timezo
 
 Both endpoints derive business and owner IDs from the JWT and verify the business/owner relationship. Missing or out-of-scope businesses return `404`.
 
+### WhatsApp number configuration
+
+| Method | Endpoint | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/api/v1/business/whatsapp` | JWT | Read safe WhatsApp number settings for the authenticated business. |
+| `PATCH` | `/api/v1/business/whatsapp` | JWT | Configure the workspace's one WhatsApp Business number. |
+
+Both endpoints use the authenticated owner's JWT scope and verify the business using both business ID and owner user ID. They never accept a client-supplied business ID. The response contains only `phoneNumberId`, optional `displayNumber`, and `connectionStatus`; it never returns `credentialRef`, access tokens, app secrets, verification tokens, or other credentials.
+
+PATCH request:
+
+```json
+{
+  "phoneNumberId": "123456789012345",
+  "displayNumber": "+919876543210"
+}
+```
+
+`phoneNumberId` is required, trimmed, and must contain 1–32 digits. `displayNumber` is optional and, when supplied, must be an international phone number with 7–15 digits and an optional leading `+`, up to 16 characters total. Unknown and protected fields are rejected. The backend updates the nested fields individually, preserves other WhatsApp settings, and sets `connectionStatus` to `configured_not_verified`.
+
+Both endpoints return this safe structure (`displayNumber` and `phoneNumberId` may be omitted when not set):
+
+```json
+{
+  "success": true,
+  "whatsapp": {
+    "phoneNumberId": "123456789012345",
+    "displayNumber": "+919876543210",
+    "connectionStatus": "configured_not_verified"
+  }
+}
+```
+
+The status is `not_configured` when no Phone Number ID is saved and `configured_not_verified` when one is saved. Saving a number does not verify Meta connectivity. There is no Meta verification flow or disconnect/clear operation in this step. Invalid data returns `400`; a missing or out-of-scope business returns `404`.
+
 ## Products and services (catalog items)
 
 | Method | Endpoint | Auth | Purpose |
@@ -160,6 +195,165 @@ Create request:
 Both fields are required trimmed non-empty strings. The backend derives `businessId` from the JWT and sets new FAQs active. Clients cannot set `businessId` or `isActive`. PATCH accepts a non-empty subset of `question` and `answer`; supplied values must remain non-empty, and unknown/protected fields are rejected. FAQ responses contain safe FAQ fields and do not expose internal business references.
 
 All item operations are scoped to the authenticated business. Invalid IDs return `400`; absent and out-of-scope FAQs return the same `404` response. DELETE sets `isActive` to `false` and never removes the database record.
+
+## WhatsApp webhooks
+
+| Method | Endpoint | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/api/v1/webhooks/whatsapp` | Public; Meta verify token | Verify the callback URL with Meta. |
+| `POST` | `/api/v1/webhooks/whatsapp` | Public; Meta HMAC signature | Receive incoming text messages and outgoing-message status events. |
+
+### Webhook verification
+
+Meta sends the query parameters `hub.mode`, `hub.verify_token`, and `hub.challenge`. Verification succeeds only when `hub.mode` is `subscribe` and the supplied token matches the backend's configured `WHATSAPP_VERIFY_TOKEN`.
+
+Success (`200`) returns `hub.challenge` as plain text. Invalid or incomplete verification returns `403`:
+
+```json
+{ "success": false, "message": "Webhook verification failed." }
+```
+
+If the verify token is not configured, the endpoint returns `503` with `"WhatsApp webhook verification is not configured."`.
+
+### Incoming webhook callback
+
+The POST callback verifies `X-Hub-Signature-256` as an HMAC-SHA256 signature over the original raw request bytes using the backend `META_APP_SECRET`. The webhook route is mounted before JSON parsing so signature validation uses those bytes. Missing or invalid signatures return `401`; missing signature configuration returns `503`. A non-buffer request body or malformed JSON returns `400`.
+
+The implemented ingestion supports incoming **text** messages containing the sender WhatsApp ID, provider message ID, text body, and optional provider timestamp and contact profile name. It also processes `sent`, `delivered`, `read`, and `failed` status entries from `value.statuses`. Media, unsupported event types, malformed individual entries, and status events without a resolvable business/message are safely ignored when another valid event exists. For each supported message or status, the backend resolves the business from `metadata.phone_number_id` matched to a uniquely stored `whatsapp.phoneNumberId`; an unknown or ambiguous number mapping is acknowledged without an unscoped write.
+
+For a resolved business, the backend uses a MongoDB transaction to find or create the business-scoped customer and conversation, reopen a closed conversation, persist the inbound message, and update the conversation's last-message summary. The business and provider message ID enforce duplicate handling: an already-persisted delivery is not inserted again. Status events update only an outbound message matching both the resolved business and provider message ID. Unknown IDs and inbound messages are not changed. Status transitions advance `sent` → `delivered` → `read`; older events cannot regress state, duplicate/non-advancing events do not write, `failed` is terminal, and failure can replace `sent` but not `delivered`/`read`. At equal timestamps, forward success progression is accepted; conflicting terminal outcomes preserve the already stored outcome. The provider status timestamp and bounded failure code/title are stored separately from the message timestamp; raw provider error objects are not persisted. Webhook callbacks do not return stored message data.
+
+Successfully persisted incoming messages or status updates, confirmed duplicates/stale updates, unknown number/message mappings, and ignored unsupported events are acknowledged with `200`:
+
+```json
+{ "success": true, "message": "Webhook event processed." }
+```
+
+Ignored events or events with no resolvable business use `"Webhook event ignored."` instead. Malformed supported payloads with no other valid event return `400` with `"Malformed supported webhook payload."`; malformed individual entries do not prevent valid sibling events from being processed. A persistence or other ingestion failure returns retryable `503`:
+
+```json
+{ "success": false, "message": "Webhook processing is temporarily unavailable." }
+```
+
+### Conversations and messages
+
+| Method | Endpoint | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/api/v1/conversations` | JWT | List conversations for the authenticated business. |
+| `GET` | `/api/v1/conversations/:conversationId/messages` | JWT | Read paginated messages for one owned conversation. |
+| `POST` | `/api/v1/conversations/:conversationId/messages` | JWT | Send a text message to the customer in an existing conversation. |
+
+### Conversation inbox and message history
+
+Both GET endpoints require a JWT. They derive `businessId` from the verified token; clients cannot select another business. Both accept optional `page` and `limit` query parameters, defaulting to `1` and `20`. They must be positive integers, and `limit` cannot exceed `100`. Unknown query parameters and invalid pagination values return `400` with field errors. The list endpoint uses the message `"Invalid conversation filters."`; history uses `"Invalid message history filters."`.
+
+`GET /api/v1/conversations` lists only the authenticated business's conversations, sorted by latest activity descending. Activity is `lastMessageAt`, falling back to the conversation's `updatedAt` when no message time is available; ties use conversation ID descending. The customer details are limited to `profileName` and `phoneNumber`. The response is:
+
+```json
+{
+  "success": true,
+  "conversations": [
+    {
+      "id": "conversation-id",
+      "customer": { "profileName": "Sam", "phoneNumber": "919876543210" },
+      "status": "open",
+      "lastMessagePreview": "Do you have this in blue?",
+      "lastActivityAt": "2026-11-01T10:00:00.000Z"
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "limit": 20,
+    "totalItems": 1,
+    "totalPages": 1
+  }
+}
+```
+
+An empty result returns `"conversations": []` and `totalPages: 0`.
+
+`GET /api/v1/conversations/:conversationId/messages` first verifies that the conversation belongs to the authenticated business. It returns `404` with `"Conversation not found."` when missing or out of scope. Messages are queried using both the JWT business ID and conversation ID. Each page is selected newest first using the existing `{ businessId, conversationId, createdAt }` history index, then returned oldest to newest within that page. The message response contains only safe inbox fields:
+
+```json
+{
+  "success": true,
+  "messages": [
+    {
+      "id": "message-id",
+      "direction": "inbound",
+      "messageType": "text",
+      "text": "Do you have this in blue?",
+      "status": "received",
+      "timestamp": "2026-11-01T09:59:00.000Z",
+      "createdAt": "2026-11-01T10:00:00.000Z"
+    },
+    {
+      "id": "outbound-message-id",
+      "direction": "outbound",
+      "messageType": "text",
+      "text": "We are currently out of stock.",
+      "status": "failed",
+      "providerErrorCode": "131",
+      "providerErrorTitle": "Message undeliverable",
+      "createdAt": "2026-11-01T10:01:00.000Z"
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "limit": 20,
+    "totalItems": 2,
+    "totalPages": 1
+  }
+}
+```
+
+The supported message status values are `sent`, `delivered`, `read`, and `failed` for outgoing messages, and `received` for incoming messages. For failed messages, `providerErrorCode` (maximum 64 characters) and `providerErrorTitle` (maximum 200 characters) are included only when Meta supplied those details. Both fields are optional. Raw provider error objects and internal database details are never returned. The provider `timestamp` is omitted when unavailable. An empty history returns `"messages": []` and `totalPages: 0`. Invalid conversation IDs return `400` with `"Invalid conversation ID."`.
+
+The request body accepts only a trimmed, non-empty `text` string up to the Message model's 4,096-character limit. Unknown fields are rejected. Business and user scope comes from the JWT; the client must not submit `businessId`, customer IDs, provider IDs, direction, or status.
+
+```json
+{ "text": "Hello, how can we help?" }
+```
+
+Before sending, the backend validates the conversation ID, retrieves the conversation within the JWT business, retrieves its customer within the same business, and retrieves the business for the authenticated owner. Missing or out-of-scope conversation, customer, or business returns `404`. A missing WhatsApp configuration returns `503`. Only after these checks does the backend call the Meta Cloud API using the business's stored phone-number ID. It does not automatically retry provider POST requests.
+
+On successful provider acceptance and local persistence, the backend stores an outbound text message with status `sent`, the returned provider message ID, and the JWT-derived business/conversation/customer references. It updates `lastMessageAt` and `lastMessagePreview` on the conversation. Success (`201`) returns:
+
+```json
+{
+  "success": true,
+  "message": "WhatsApp message sent successfully.",
+  "data": {
+    "message": {
+      "id": "message-id",
+      "conversationId": "conversation-id",
+      "customerId": "customer-id",
+      "direction": "outbound",
+      "messageType": "text",
+      "text": "Hello, how can we help?",
+      "providerMessageId": "wamid.example",
+      "status": "sent",
+      "createdAt": "2026-11-01T10:00:00.000Z",
+      "updatedAt": "2026-11-01T10:00:00.000Z"
+    }
+  }
+}
+```
+
+`timestamp` is included in the serialized message only when present. A duplicate provider ID matching an already-recorded outbound message in that conversation returns `200` with `"Message was already recorded."` and the same safe `data.message` shape.
+
+Relevant error responses are:
+
+| Status | Behavior |
+|---|---|
+| `400` | Invalid conversation ID or invalid body; body validation uses `"Invalid message data."` and may include field-level `errors`. |
+| `401` | Missing or invalid JWT; `"Authentication required."` |
+| `404` | Conversation, its business-scoped customer, or authenticated business not found. |
+| `502` | Provider rejection, or an uncertain provider outcome such as a provider `5xx`, timeout, network failure, or invalid success response. For uncertain outcomes the message advises checking the conversation before retrying. |
+| `503` | WhatsApp configuration or stored send input is unavailable/invalid, or the provider may have accepted the message but local persistence/summary update did not complete. The latter response says: `"WhatsApp may have accepted this message, but local persistence did not complete. Check the conversation before retrying."` Configuration/input errors use `"WhatsApp message sending is not configured correctly."` |
+| `500` | Unexpected pre-send request processing failure; `"Unable to process the message request."` |
+
+If Meta accepts a message but local persistence fails, the backend does not resend it. It returns the warning above so the owner can check the conversation before taking further action. The inbox can display the current stored status after refreshing message history; it does not currently poll or refresh in real time. Automatic replies and delivery-triggered frontend refresh are not implemented.
 
 ## Errors and status codes
 
