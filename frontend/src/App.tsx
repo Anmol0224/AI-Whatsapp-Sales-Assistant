@@ -1,8 +1,25 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import { DashboardLayout } from './components/DashboardLayout'
 import { useAuth } from './context/AuthContext'
+import { BusinessProfilePage } from './pages/BusinessProfilePage'
+import { CatalogPage } from './pages/CatalogPage'
 import { DashboardPage } from './pages/DashboardPage'
+import { FaqsPage } from './pages/FaqsPage'
 import { LoginPage } from './pages/LoginPage'
 import { RegisterPage } from './pages/RegisterPage'
+
+const dashboardRoutes = {
+  '/dashboard': { title: 'Overview' },
+  '/dashboard/business': { title: 'Business Profile' },
+  '/dashboard/catalog': { title: 'Products & Services' },
+  '/dashboard/faqs': { title: 'FAQs' },
+} as const
+
+type DashboardPath = keyof typeof dashboardRoutes
+
+function isDashboardPath(pathname: string): boolean {
+  return pathname === '/dashboard' || pathname.startsWith('/dashboard/')
+}
 
 function AppContent() {
   const { user, loading, restoreError, retryRestore, logout } = useAuth()
@@ -14,16 +31,19 @@ function AppContent() {
     return () => window.removeEventListener('popstate', onPopState)
   }, [])
 
-  function navigate(path: string, replace = false) {
+  const navigate = useCallback((path: string, replace = false) => {
     if (replace) window.history.replaceState({}, '', path)
     else window.history.pushState({}, '', path)
     setPathname(path)
-  }
+  }, [])
 
   useEffect(() => {
-    if (user && pathname !== '/dashboard') navigate('/dashboard', true)
-    else if (!user && !loading && pathname === '/dashboard' && !restoreError) navigate('/login', true)
-  }, [user, loading, pathname, restoreError])
+    if (user && !(pathname in dashboardRoutes)) {
+      navigate('/dashboard', true)
+    } else if (!user && !loading && isDashboardPath(pathname) && !restoreError) {
+      navigate('/login', true)
+    }
+  }, [user, loading, pathname, restoreError, navigate])
 
   if (loading) {
     return (
@@ -52,10 +72,39 @@ function AppContent() {
     )
   }
 
-  if (user) return <DashboardPage onNavigate={navigate} />
+  if (user) {
+    const routePath = (pathname in dashboardRoutes ? pathname : '/dashboard') as DashboardPath
+    const route = dashboardRoutes[routePath]
+    let page = <DashboardPage onNavigate={navigate} />
 
-  const route = pathname === '/register' ? 'register' : 'login'
-  return route === 'register' ? <RegisterPage onNavigate={navigate} /> : <LoginPage onNavigate={navigate} />
+    if (routePath === '/dashboard/business') {
+      page = <BusinessProfilePage />
+    } else if (routePath === '/dashboard/catalog') {
+      page = <CatalogPage />
+    } else if (routePath === '/dashboard/faqs') {
+      page = <FaqsPage />
+    } else if (routePath !== '/dashboard') {
+      page = (
+        <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm sm:p-8">
+          <p className="text-sm font-semibold text-emerald-700">Coming next</p>
+          <h2 className="mt-2 text-xl font-semibold text-slate-950">{route.title}</h2>
+          <p className="mt-2 text-sm leading-6 text-slate-600">
+            This management page will be available in a later step.
+          </p>
+        </section>
+      )
+    }
+
+    return (
+      <DashboardLayout pathname={routePath} title={route.title} onNavigate={navigate}>
+        {page}
+      </DashboardLayout>
+    )
+  }
+
+  return pathname === '/register'
+    ? <RegisterPage onNavigate={navigate} />
+    : <LoginPage onNavigate={navigate} />
 }
 
 function App() {

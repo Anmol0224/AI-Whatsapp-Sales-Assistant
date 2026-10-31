@@ -35,6 +35,124 @@ export type CurrentAccountResponse = {
   business: SafeBusiness
 }
 
+export type BusinessContactDetails = {
+  phone?: string
+  email?: string
+  website?: string
+  address?: string
+}
+
+export type BusinessProfile = {
+  id: string
+  name: string
+  description?: string
+  industry?: string
+  contactDetails: BusinessContactDetails
+  timezone?: string
+}
+
+export type BusinessProfileResponse = {
+  success: true
+  business: BusinessProfile
+}
+
+export type BusinessProfileUpdate = {
+  name?: string
+  description?: string
+  industry?: string
+  contactDetails?: BusinessContactDetails
+  timezone?: string
+}
+
+export type CatalogItemKind = 'product' | 'service'
+
+export type CatalogItem = {
+  id: string
+  kind: CatalogItemKind
+  name: string
+  description?: string
+  priceInPaise?: number
+  currency: 'INR'
+  availability?: string
+  isActive: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export type CatalogPagination = {
+  page: number
+  limit: number
+  totalItems: number
+  totalPages: number
+}
+
+export type CatalogItemsResponse = {
+  success: true
+  items: CatalogItem[]
+  pagination: CatalogPagination
+}
+
+export type CatalogItemResponse = {
+  success: true
+  item: CatalogItem
+}
+
+export type CatalogItemDeactivationResponse = CatalogItemResponse & {
+  message: string
+}
+
+export type CatalogItemCreateData = {
+  kind: CatalogItemKind
+  name: string
+  description?: string
+  priceInPaise?: number
+  currency?: 'INR'
+  availability?: string
+}
+
+export type CatalogItemUpdateData = Partial<CatalogItemCreateData>
+
+export type CatalogFilters = {
+  page?: number
+  limit?: number
+  kind?: CatalogItemKind
+  isActive?: boolean
+}
+
+export type Faq = {
+  id: string
+  question: string
+  answer: string
+  isActive: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export type FaqResponse = {
+  success: true
+  faq: Faq
+}
+
+export type FaqDeactivationResponse = FaqResponse & {
+  message: string
+}
+
+export type FaqsResponse = {
+  success: true
+  faqs: Faq[]
+}
+
+export type FaqCreateData = {
+  question: string
+  answer: string
+}
+
+export type FaqUpdateData = Partial<FaqCreateData>
+
+export type FaqFilters = {
+  isActive?: boolean
+}
+
 export class ApiError extends Error {
   readonly status?: number
 
@@ -119,6 +237,134 @@ function isCurrentAccountResponse(value: unknown): value is CurrentAccountRespon
     value.success === true &&
     isSafeAccount(value.user) &&
     isSafeBusiness(value.business)
+  )
+}
+
+function hasOptionalStringProperties(value: Record<string, unknown>, keys: string[]): boolean {
+  return keys.every((key) => !(key in value) || typeof value[key] === 'string')
+}
+
+function isBusinessContactDetails(value: unknown): value is BusinessContactDetails {
+  return (
+    isRecord(value) &&
+    hasOptionalStringProperties(value, ['phone', 'email', 'website', 'address'])
+  )
+}
+
+function isBusinessProfile(value: unknown): value is BusinessProfile {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.name === 'string' &&
+    (value.description === undefined || typeof value.description === 'string') &&
+    (value.industry === undefined || typeof value.industry === 'string') &&
+    isBusinessContactDetails(value.contactDetails) &&
+    (value.timezone === undefined || typeof value.timezone === 'string')
+  )
+}
+
+function isBusinessProfileResponse(value: unknown): value is BusinessProfileResponse {
+  return isRecord(value) && value.success === true && isBusinessProfile(value.business)
+}
+
+function isDateString(value: unknown): value is string {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value))
+}
+
+function isCatalogItem(value: unknown): value is CatalogItem {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    (value.kind === 'product' || value.kind === 'service') &&
+    typeof value.name === 'string' &&
+    (value.description === undefined || typeof value.description === 'string') &&
+    (value.priceInPaise === undefined ||
+      (typeof value.priceInPaise === 'number' &&
+        Number.isSafeInteger(value.priceInPaise) &&
+        value.priceInPaise >= 0)) &&
+    value.currency === 'INR' &&
+    (value.availability === undefined || typeof value.availability === 'string') &&
+    typeof value.isActive === 'boolean' &&
+    isDateString(value.createdAt) &&
+    isDateString(value.updatedAt)
+  )
+}
+
+function isCatalogPagination(value: unknown): value is CatalogPagination {
+  return (
+    isRecord(value) &&
+    Number.isSafeInteger(value.page) &&
+    typeof value.page === 'number' &&
+    value.page > 0 &&
+    Number.isSafeInteger(value.limit) &&
+    typeof value.limit === 'number' &&
+    value.limit > 0 &&
+    value.limit <= 100 &&
+    Number.isSafeInteger(value.totalItems) &&
+    typeof value.totalItems === 'number' &&
+    value.totalItems >= 0 &&
+    Number.isSafeInteger(value.totalPages) &&
+    typeof value.totalPages === 'number' &&
+    value.totalPages >= 0
+  )
+}
+
+function isCatalogItemsResponse(value: unknown): value is CatalogItemsResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    Array.isArray(value.items) &&
+    value.items.every(isCatalogItem) &&
+    isCatalogPagination(value.pagination)
+  )
+}
+
+function isCatalogItemResponse(value: unknown): value is CatalogItemResponse {
+  return isRecord(value) && value.success === true && isCatalogItem(value.item)
+}
+
+function isCatalogItemDeactivationResponse(
+  value: unknown,
+): value is CatalogItemDeactivationResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    typeof value.message === 'string' &&
+    isCatalogItem(value.item)
+  )
+}
+
+function isFaq(value: unknown): value is Faq {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.question === 'string' &&
+    typeof value.answer === 'string' &&
+    typeof value.isActive === 'boolean' &&
+    isDateString(value.createdAt) &&
+    isDateString(value.updatedAt)
+  )
+}
+
+function isFaqResponse(value: unknown): value is FaqResponse {
+  return isRecord(value) && value.success === true && isFaq(value.faq)
+}
+
+function isFaqDeactivationResponse(value: unknown): value is FaqDeactivationResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    typeof value.message === 'string' &&
+    isFaq(value.faq)
+  )
+}
+
+function isFaqsResponse(value: unknown): value is FaqsResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    Array.isArray(value.faqs) &&
+    value.faqs.every(isFaq)
   )
 }
 
@@ -222,4 +468,103 @@ export function getCurrentAccount(): Promise<CurrentAccountResponse> {
   })
   accountRequest = { token, promise }
   return promise
+}
+
+export function getBusinessProfile(): Promise<BusinessProfileResponse> {
+  return requestJson('/business', isBusinessProfileResponse, {}, true)
+}
+
+export function updateBusinessProfile(
+  data: BusinessProfileUpdate,
+): Promise<BusinessProfileResponse> {
+  return requestJson(
+    '/business',
+    isBusinessProfileResponse,
+    { method: 'PATCH', body: JSON.stringify(data) },
+    true,
+  )
+}
+
+function buildQuery(path: string, values: Record<string, string | number | boolean | undefined>): string {
+  const params = new URLSearchParams()
+  for (const [key, value] of Object.entries(values)) {
+    if (value !== undefined) params.set(key, String(value))
+  }
+  const query = params.toString()
+  return query ? `${path}?${query}` : path
+}
+
+export function getCatalogItems(filters: CatalogFilters = {}): Promise<CatalogItemsResponse> {
+  const path = buildQuery('/catalog-items', {
+    page: filters.page,
+    limit: filters.limit,
+    kind: filters.kind,
+    isActive: filters.isActive,
+  })
+  return requestJson(path, isCatalogItemsResponse, {}, true)
+}
+
+export function getCatalogItem(id: string): Promise<CatalogItemResponse> {
+  return requestJson(`/catalog-items/${encodeURIComponent(id)}`, isCatalogItemResponse, {}, true)
+}
+
+export function createCatalogItem(data: CatalogItemCreateData): Promise<CatalogItemResponse> {
+  return requestJson(
+    '/catalog-items',
+    isCatalogItemResponse,
+    { method: 'POST', body: JSON.stringify(data) },
+    true,
+  )
+}
+
+export function updateCatalogItem(
+  id: string,
+  data: CatalogItemUpdateData,
+): Promise<CatalogItemResponse> {
+  return requestJson(
+    `/catalog-items/${encodeURIComponent(id)}`,
+    isCatalogItemResponse,
+    { method: 'PATCH', body: JSON.stringify(data) },
+    true,
+  )
+}
+
+export function deactivateCatalogItem(id: string): Promise<CatalogItemDeactivationResponse> {
+  return requestJson(
+    `/catalog-items/${encodeURIComponent(id)}`,
+    isCatalogItemDeactivationResponse,
+    { method: 'DELETE' },
+    true,
+  )
+}
+
+export function getFaqs(filters: FaqFilters = {}): Promise<FaqsResponse> {
+  const path = buildQuery('/faqs', { isActive: filters.isActive })
+  return requestJson(path, isFaqsResponse, {}, true)
+}
+
+export function getFaq(id: string): Promise<FaqResponse> {
+  return requestJson(`/faqs/${encodeURIComponent(id)}`, isFaqResponse, {}, true)
+}
+
+export function createFaq(data: FaqCreateData): Promise<FaqResponse> {
+  return requestJson('/faqs', isFaqResponse, { method: 'POST', body: JSON.stringify(data) }, true)
+}
+
+export function updateFaq(id: string, data: FaqUpdateData): Promise<FaqResponse> {
+  return requestJson(
+    `/faqs/${encodeURIComponent(id)}`,
+    isFaqResponse,
+    { method: 'PATCH', body: JSON.stringify(data) },
+    true,
+  )
+}
+
+export function deactivateFaq(id: string): Promise<FaqDeactivationResponse> {
+  return requestJson(
+    `/faqs/${encodeURIComponent(id)}`,
+    isFaqDeactivationResponse,
+    { method: 'DELETE' },
+    true,
+  )
 }

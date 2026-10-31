@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed MongoDB collections and fields only. No schema, database, indexes, or sample records are implemented. Field types use MongoDB/Mongoose conventions (`ObjectId`, `String`, `Date`, `Boolean`, `Number`, embedded objects). Seven collections are planned: `users`, `businesses`, `catalogItems`, `faqs`, `customers`, `conversations`, and `messages`.
+This document combines implemented Phase 3/4 models with proposed future collections. The backend contains Mongoose models and indexes for `users`, `businesses`, `catalogItems`, and `faqs`, plus a MongoDB connection configured to select `whatsapp_sales_assistant`. The connection code does not establish whether Atlas is reachable in a particular environment. `customers`, `conversations`, and `messages` remain proposed; no models for them are implemented. Field types use MongoDB/Mongoose conventions (`ObjectId`, `String`, `Date`, `Boolean`, `Number`, and embedded objects).
 
 ## Collections and fields
 
@@ -27,7 +27,7 @@ Proposed MongoDB collections and fields only. No schema, database, indexes, or s
 | `name` | String | Required business display name. |
 | `description` | String | Optional factual business description. |
 | `industry` | String | Optional category. |
-| `contactDetails` | Object | Optional owner-configured public details; allowed fields to be defined. |
+| `contactDetails` | Object | Optional owner-configured public details; current profile API supports phone, email, website, and address. |
 | `timezone` | String | Optional IANA timezone for display. |
 | `whatsapp` | Object | `phoneNumberId`, display number, connection status, and credential reference/metadata. Never plaintext tokens. |
 | `aiSettings` | Object | `enabledByDefault`, model identifier/configuration, context-message limit, and communication preferences. No secrets. |
@@ -47,7 +47,7 @@ Products and services share this collection, distinguished by `kind`.
 | `name` | String | Required. |
 | `description` | String | Optional factual details. |
 | `priceInPaise` | Number | Optional integer minor units for INR; do not use floating-point monetary arithmetic. |
-| `currency` | String | ISO currency code; required when price is present. Current MVP currency is expected to be INR, but confirm before implementation. |
+| `currency` | String | Required and constrained to `INR` by the current model; defaults to `INR`, including when no price is supplied. |
 | `availability` | String | Optional owner-maintained availability statement; do not infer live stock from stale text. |
 | `isActive` | Boolean | Whether it may be included in AI context. |
 | `createdAt`, `updatedAt` | Date | Timestamps. |
@@ -134,17 +134,21 @@ All records owned by a business (`catalogItems`, `faqs`, `customers`, `conversat
 
 For an inbound message, find an `open` WhatsApp conversation for the same `{ businessId, customerId, channel }` and reuse it. If none exists, create one. Closing a conversation is an explicit owner action or a later agreed lifecycle rule; the next inbound after closure creates a new conversation. Do not add an unconditional unique index for open conversations. Concurrent webhook creation can briefly race; handle duplicate candidates by re-querying and selecting one canonical open conversation, or use a carefully scoped partial unique index only if lifecycle semantics and MongoDB support are validated.
 
-## Proposed indexes
+## Indexes
 
-- `users`: unique `{ email: 1 }`; unique `{ businessId: 1 }` where required to enforce one workspace per owner reference if nullable registration flow permits.
+The following indexes are declared in the current Mongoose models:
+
+- `users`: unique `{ email: 1 }` and unique `{ businessId: 1 }`.
 - `businesses`: unique `{ ownerUserId: 1 }`.
 - `catalogItems`: `{ businessId: 1, isActive: 1, kind: 1 }`.
 - `faqs`: `{ businessId: 1, isActive: 1 }`.
+
+The remaining indexes below are proposed for the future customer, conversation, and message models; they are not implemented:
 - `customers`: unique compound `{ businessId: 1, whatsappId: 1 }`.
 - `conversations`: `{ businessId: 1, customerId: 1, channel: 1, status: 1 }` for lookup; `{ businessId: 1, lastMessageAt: -1 }` for inbox sorting. No unconditional unique open-conversation index.
 - `messages`: unique partial compound `{ businessId: 1, providerMessageId: 1 }` when provider ID exists; `{ businessId: 1, conversationId: 1, createdAt: -1 }` for pagination; `{ processingStatus: 1, updatedAt: 1 }` for bounded recovery scans if query plans justify it.
 
-The unique business-scoped provider ID index makes duplicate webhook insertion fail safely; on duplicate-key conflict, load the existing message and acknowledge the event without repeating downstream work. Provider status events should match the existing outbound provider ID and apply idempotently. Validate index definitions against actual MongoDB/Mongoose queries before implementation.
+When the message model is implemented, a unique business-scoped provider ID index can make duplicate webhook insertion fail safely; on duplicate-key conflict, load the existing message and acknowledge the event without repeating downstream work. Provider status events should match the existing outbound provider ID and apply idempotently. Validate proposed index definitions against actual MongoDB/Mongoose queries before implementation.
 
 ## Example documents
 

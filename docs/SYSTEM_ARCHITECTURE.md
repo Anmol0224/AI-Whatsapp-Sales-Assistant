@@ -2,7 +2,7 @@
 
 ## Status and design summary
 
-This is a proposed design, not an implementation. A React/Vite browser client calls a versioned Node.js/Express API. The API owns authentication, business workflows, persistence, webhook handling, AI orchestration, and outbound messaging. MongoDB Atlas is accessed through Mongoose. Gemini and Meta are isolated behind backend adapters so core business logic does not depend on provider-specific payloads.
+This document describes a partially implemented target architecture. The React/Vite/TypeScript frontend and Node.js/Express/TypeScript backend are present. MongoDB access uses Mongoose. Registration/login, JWT authentication, and business profile, catalog, and FAQ management are implemented. Customer conversations, message processing, WhatsApp webhooks/sending, Gemini orchestration, and human takeover remain planned; their flows below are architectural proposals, not working integrations. External provider configuration is not implied by the source code.
 
 For Version 1.0, one owner has one business workspace, and each workspace has at most one connected WhatsApp Business number. Every business-owned record is scoped by `businessId`. The design uses MongoDB-backed state for idempotency and processing coordination; it deliberately adds no Redis, Kafka, or external queue.
 
@@ -31,24 +31,24 @@ flowchart LR
 
 | Component | Responsibility |
 |---|---|
-| React frontend | Registration/login, business profile and knowledge forms, AI settings, dashboard, customer list, chat inbox, message history, owner send, processing/error display, and takeover/resume controls. Holds no provider API keys. |
-| Express backend | Versioned REST endpoints, validation, authentication/authorization middleware, business workflows, webhook routes, processing orchestration, error mapping, and rate limiting. |
-| Authentication module | Normalize email; hash and verify passwords with bcrypt; issue and validate JWTs; attach the authenticated user's `businessId` to authorized request context. Token lifetime/storage and true revocation remain open decisions. |
-| Business module | Read/update the business profile, AI settings and communication preferences; manage active products/services and FAQs; return only business-scoped facts for AI context. |
-| Customer and conversation module | Create/find customers, reuse or create conversations, persist messages, list customers and inbox items, paginate history, update modes, manage processing state, retry eligible work, and enforce business ownership. |
-| WhatsApp integration adapter | Verify GET challenge and POST signatures, parse supported events, normalize messages/statuses, deduplicate provider deliveries, send text messages, and map provider results to internal statuses. It contains Meta-specific behavior only. |
-| AI integration adapter | Build bounded, controlled prompts; call Gemini on the server; validate response shape/content constraints; map provider errors. It contains Google-specific behavior only. |
-| MongoDB Atlas + Mongoose | Persist the seven proposed collections: `users`, `businesses`, `catalogItems`, `faqs`, `customers`, `conversations`, and `messages`. Unique/compound indexes support identity, idempotency, lookup, and pagination. |
+| React frontend | Implemented: registration/login, authenticated dashboard, business profile, catalog, and FAQ screens. Planned: AI settings, customer list, chat inbox, message history, owner send, processing/error display, and takeover/resume controls. Holds no provider API keys. |
+| Express backend | Implemented: versioned REST endpoints for health, auth, business profile, catalog, and FAQs; validation, authentication/authorization middleware, error mapping, and rate limiting. Planned: webhook routes and message-processing orchestration. |
+| Authentication module | Implemented: email normalization, bcrypt password verification/hashing, JWT issue/verification, and authenticated user/business claims. Frontend session token uses sessionStorage; no refresh token or server-side revocation endpoint exists. |
+| Business module | Implemented: safe business profile read/update and business-scoped catalog/FAQ CRUD. Planned: AI settings and retrieval/context assembly for responses. |
+| Customer and conversation module | Planned: create/find customers, reuse or create conversations, persist messages, list customers and inbox items, paginate history, update modes, manage processing state, retry eligible work, and enforce business ownership. |
+| WhatsApp integration adapter | Planned only: verify GET challenge and POST signatures, parse supported events, normalize messages/statuses, deduplicate provider deliveries, send text messages, and map provider results to internal statuses. |
+| AI integration adapter | Planned only: build bounded, controlled prompts; call Gemini on the server; validate response shape/content constraints; map provider errors. |
+| MongoDB Atlas + Mongoose | Implemented models/indexes: `users`, `businesses`, `catalogItems`, and `faqs`. Planned collections: `customers`, `conversations`, and `messages`; associated idempotency, lookup, and pagination indexes are not yet implemented. |
 | Deployment | Vercel is proposed for the frontend and Render for the backend. Atlas, provider accounts, credentials, and reachable HTTPS webhook configuration are external prerequisites, not assumed configured. |
 
-## Owner and inbox data flow
+## Owner setup and planned inbox data flow
 
-1. The owner registers, creating one user and one business workspace; registration must prevent an email from being registered twice.
-2. The owner signs in. The API verifies credentials and returns a JWT; protected requests resolve the workspace from the authenticated user record.
-3. Profile, catalog, FAQ, and AI-setting requests are validated and read/written through the business module.
-4. The customer list, conversations, message history, processing status, and errors are served from business-scoped records. The frontend never accesses MongoDB directly.
+1. **Implemented:** The owner registers, creating one user and one business workspace; duplicate emails are rejected.
+2. **Implemented:** The owner signs in. The API verifies credentials and returns a JWT; protected requests use verified user/business claims.
+3. **Implemented:** Profile, catalog, and FAQ requests are validated and handled through business-scoped endpoints. AI-setting requests remain planned.
+4. **Planned:** Customer lists, conversations, message history, processing status, and errors will be served from business-scoped records. The frontend will not access MongoDB directly.
 
-## Complete WhatsApp message flow
+## Proposed WhatsApp message flow (not implemented)
 
 1. A customer sends a message to the business WhatsApp number.
 2. Meta sends a webhook event to the backend.
@@ -126,11 +126,11 @@ Resume AI clears the takeover request and changes mode to `ai` only after any di
 ## Security boundaries and open questions
 
 - Provider credentials, JWT signing secret, and webhook secrets remain server-side and out of source control.
-- Every query/write on business-owned records is scoped by `businessId` from the authenticated user; parent/child references are verified.
+- Target rule for future conversation/message features: scope every query/write on business-owned records by the authenticated `businessId` and verify parent/child references. Existing profile, catalog, and FAQ APIs already apply business scoping.
 - Passwords are stored as bcrypt hashes. Use HTTPS, validation, bounded request sizes, rate limits, and logs that omit secrets and unnecessary message content.
 - Customer phone numbers and messages are personal data; retention/deletion periods, backup policy, and production deletion responsibilities need approval.
 - One owner per business is the MVP; operator roles are deferred.
-- Decide JWT lifetime, refresh/revocation, and browser storage.
+- Confirm the production JWT lifetime policy and decide whether refresh tokens or server-side revocation are needed. The current frontend stores the access token in sessionStorage, and the backend defaults to a one-hour lifetime.
 - Decide secure provisioning/storage of Meta credentials for the demo.
 - Decide Gemini model and token limits, automatic versus owner-approved send behavior, and whether a fallback clarification may be sent.
 - Confirm current Meta webhook, messaging-window, and policy requirements during implementation. Accounts and integrations are not assumed configured.

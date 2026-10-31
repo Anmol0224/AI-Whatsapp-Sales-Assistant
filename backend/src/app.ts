@@ -5,6 +5,9 @@ import { rateLimit } from "express-rate-limit";
 import { env } from "./config/env.js";
 import errorHandler from "./middleware/error-handler.js";
 import authRouter from "./routes/v1/auth.routes.js";
+import businessRouter from "./routes/v1/business.routes.js";
+import catalogItemsRouter from "./routes/v1/catalog-items.routes.js";
+import faqsRouter from "./routes/v1/faqs.routes.js";
 import healthRouter from "./routes/v1/health.routes.js";
 
 const app = express();
@@ -35,6 +38,9 @@ app.use(helmet());
 app.use(cors(corsOptions));
 app.use(express.json({ limit: "100kb" }));
 app.use("/api/v1/auth", apiRateLimiter, authRouter);
+app.use("/api/v1/business", apiRateLimiter, businessRouter);
+app.use("/api/v1/catalog-items", apiRateLimiter, catalogItemsRouter);
+app.use("/api/v1/faqs", apiRateLimiter, faqsRouter);
 app.use("/api/v1", apiRateLimiter, healthRouter);
 
 app.use((_request, response) => {

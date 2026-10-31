@@ -2,7 +2,7 @@
 
 ## Status and schedule
 
-This is a proposed student-team sequence, not a completed schedule or implementation. A realistic initial estimate is about 13–16 weeks for a small team working alongside coursework, with integration and debugging buffers; provider setup delays may extend it. No phase should be marked complete until its acceptance criteria are demonstrated.
+This is the planned sequence and estimate, reconciled with the current implementation. Phases 1–3 foundations/authentication are implemented. The Phase 4 business profile, catalog, and FAQ APIs and management screens are implemented and were manually tested by the project team. Phase 4 AI settings/communication preferences and automated test coverage remain pending. Phases 5–9 remain planned; provider setup and deployment are not assumed complete. The original 13–16 week estimate is a planning estimate, not a completed schedule.
 
 ## Phases
 
@@ -24,6 +24,8 @@ This is a proposed student-team sequence, not a completed schedule or implementa
 
 ### Phase 3 — Database and authentication (about 2 weeks)
 
+- **Status:** Implemented for the current foundation: MongoDB connection/configuration; User and Business models; registration, login, JWT middleware; and authenticated frontend flows. CatalogItem and FAQ models were added in Phase 4. Customer, Conversation, and Message models, automated isolation tests, and several planned data workflows remain pending.
+
 - **Objective:** Persist core data and protect owner access.
 - **Dependencies:** Phase 2; MongoDB development connection; approved token design.
 - **Work items:** MongoDB Atlas connection, Mongoose models/indexes for seven collections, registration/login, bcrypt, JWT middleware, validation, rate limiting, tenant isolation.
@@ -32,10 +34,12 @@ This is a proposed student-team sequence, not a completed schedule or implementa
 
 ### Phase 4 — Business configuration (about 1–2 weeks)
 
-- **Objective:** Let the owner maintain the facts used by AI.
+- **Status:** Business profile, catalog, and FAQ APIs and frontend management pages are implemented. Catalog listing supports pagination. Manual testing is reported by the project team; automated tests are still pending. AI settings and communication preferences are not implemented.
+
+- **Objective:** Let the owner maintain business facts for the future AI response flow.
 - **Dependencies:** Phase 3.
 - **Work items:** Business profile, products/services, FAQs, AI settings and communication preferences; integer paise handling for INR.
-- **Acceptance criteria:** Owner can create/read/update scoped records; invalid money and cross-business references are rejected; inactive facts are excluded from retrieval.
+- **Acceptance criteria:** Owner can create/read/update scoped records; invalid money and cross-business references are rejected. When AI retrieval is implemented, inactive facts must be excluded from its context.
 - **Deliverables:** Business configuration APIs and screens, validation tests.
 
 ### Phase 5 — Inbox and messaging UI (about 2 weeks)
@@ -80,7 +84,7 @@ This is a proposed student-team sequence, not a completed schedule or implementa
 
 ## Testing strategy
 
-Testing is planned; no tests have been written or run in this planning repository.
+The following is the continuing test plan. Typecheck/build checks and manual API/UI verification have been run during implementation as reported by the project team. A repeatable automated test suite is not yet present in the repository.
 
 - Use Postman for manual REST/auth/webhook-path exploration and appropriate automated unit/API/integration tests for repeatable checks.
 - Unit-test validation, integer-paise handling, authorization, prompt assembly, webhook normalization, deduplication, state transitions, and retry eligibility.

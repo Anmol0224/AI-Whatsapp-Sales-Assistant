@@ -1,17 +1,21 @@
 # Development Tasks
 
-## Completed documentation work
+## Completed documentation and foundation work
 
 - [x] Inspect repository structure, `.gitignore`, Git history, and status.
 - [x] Review and finalize the six Phase 1 planning documents.
 - [x] Record planned architecture, database/API design, roadmap, open questions, and implementation checklist.
+- [x] Establish the React/Vite/TypeScript frontend and Node.js/Express/TypeScript backend foundations, including environment validation, security middleware, and health API.
+- [x] Configure MongoDB/Mongoose connection and implement User and Business models, registration, login, JWT authentication, and frontend auth/session handling.
+- [x] Implement CatalogItem and FAQ models with business-scoped APIs.
+- [x] Implement authenticated Business Profile, catalog, and FAQ management APIs and frontend pages; catalog listing includes pagination.
 
-These checkmarks cover documentation work only. No application implementation or integration task is complete.
+Completed items above reflect code present in the repository. Manual verification of Phase 4 APIs/UI is reported by the project team. Automated tests and external WhatsApp/Gemini integrations are not implied by these checkmarks.
 
 ## Pending — Decisions and planning follow-up
 
 - [ ] Review/approve the six documents and Version 1.0 boundaries.
-- [ ] Decide JWT lifetime, refresh/revocation, and browser token storage.
+- [ ] Confirm the production JWT lifetime policy and whether refresh tokens or server-side revocation are needed; the current frontend stores access tokens in sessionStorage and the backend defaults to a one-hour lifetime.
 - [ ] Decide Meta credential provisioning/storage for the demo.
 - [ ] Select Gemini model, context/token limits, and automatic versus owner-approved reply behavior.
 - [ ] Decide whether any fallback clarification may be automatically sent after Gemini failure.
@@ -19,23 +23,19 @@ These checkmarks cover documentation work only. No application implementation or
 - [ ] Confirm customer conversation closure/reuse policy and handling for malformed Meta events.
 - [ ] Confirm accounts, regions, and test-data approach for MongoDB Atlas, Meta, Gemini, Vercel, and Render.
 
-## Pending — Implementation tasks (not started)
+## Pending — Implementation tasks
 
 ### Foundations, database, and authentication
 
-- [ ] Create React/Vite and Express project structure; keep frontend, backend, database, and adapters separated.
-- [ ] Define safe configuration and private secret provisioning; do not commit credentials.
-- [ ] Implement seven Mongoose collections and reviewed indexes.
-- [ ] Implement one-owner/one-business registration, bcrypt hashing, login, JWT middleware, validation, rate limiting, and agreed logout behavior.
-- [ ] Enforce business-scoped authorization and verify every parent-child relationship.
+- [ ] Implement Mongoose models for customers, conversations, and messages, with reviewed indexes and parent/child ownership validation.
+- [ ] Confirm production secret provisioning and deployment configuration; do not commit credentials.
 - [ ] Add cross-business authorization tests.
 
-### Business configuration and owner UI
+### Remaining business configuration and owner UI
 
-- [ ] Implement business profile and AI settings APIs/screens.
-- [ ] Implement product/service CRUD with integer paise and currency validation.
-- [ ] Implement FAQ CRUD and active/inactive state.
-- [ ] Implement customer list, dashboard, conversation inbox, and paginated message history.
+- [ ] Implement AI settings and communication preference APIs/screens after their behavior is approved.
+- [ ] Decide whether deactivated catalog items and FAQs need an owner-facing reactivation workflow; current APIs support soft deactivation but not reactivation.
+- [ ] Implement customer list, conversation inbox, and paginated message history.
 - [ ] Show owner-visible message processing and error states.
 - [ ] Add customer data deletion flow after retention/deletion policy is approved.
 
