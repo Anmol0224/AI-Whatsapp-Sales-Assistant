@@ -224,6 +224,83 @@ export type ConversationFilters = {
   limit?: number
 }
 
+export type AiReplyDraftStatus =
+  | 'queued'
+  | 'processing'
+  | 'draft_ready'
+  | 'approved'
+  | 'rejected'
+  | 'sending'
+  | 'sent'
+  | 'send_failed'
+  | 'send_uncertain'
+  | 'failed'
+  | 'cancelled'
+
+export type AiReplyDraft = {
+  id: string
+  conversationId: string
+  sourceMessage: AiDraftSourceMessage | null
+  status: AiReplyDraftStatus
+  generatedDraft?: string
+  approvedText?: string
+  approvalEdited?: boolean
+  approvedAt?: string
+  rejectedAt?: string
+  rejectionReason?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export type AiDraftSourceMessage = {
+  id: string
+  text: string
+  timestamp?: string
+  createdAt: string
+}
+
+export type AiDraftsResponse = {
+  success: true
+  drafts: AiReplyDraft[]
+  pagination: CatalogPagination
+}
+
+export type AiDraftResponse = {
+  success: true
+  draft: AiReplyDraft
+}
+
+export type AiDraftApprovalResponse = {
+  success: true
+  message: string
+  draft: { id: string; status: 'approved'; approvedText: string }
+}
+
+export type AiDraftRejectionResponse = {
+  success: true
+  message: string
+  draft: { id: string; status: 'rejected' }
+}
+
+export type AiDraftFilters = {
+  page?: number
+  limit?: number
+  status?: AiReplyDraftStatus
+}
+
+export type ConversationResponseMode = 'human' | 'ai'
+
+export type ConversationResponseModeResponse = {
+  success: true
+  message: string
+  conversation: { id: string; responseMode: ConversationResponseMode }
+}
+
+export type ConversationResponseModeGetResponse = {
+  success: true
+  conversation: { id: string; responseMode: ConversationResponseMode }
+}
+
 export class ApiError extends Error {
   readonly status?: number
 
@@ -527,6 +604,106 @@ function isSendConversationMessageResponse(value: unknown): value is SendConvers
   )
 }
 
+const aiReplyDraftStatuses: readonly AiReplyDraftStatus[] = [
+  'queued',
+  'processing',
+  'draft_ready',
+  'approved',
+  'rejected',
+  'sending',
+  'sent',
+  'send_failed',
+  'send_uncertain',
+  'failed',
+  'cancelled',
+]
+
+function isAiReplyDraft(value: unknown): value is AiReplyDraft {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.conversationId === 'string' &&
+    (value.sourceMessage === null || isAiDraftSourceMessage(value.sourceMessage)) &&
+    aiReplyDraftStatuses.includes(value.status as AiReplyDraftStatus) &&
+    (value.generatedDraft === undefined || typeof value.generatedDraft === 'string') &&
+    (value.approvedText === undefined || typeof value.approvedText === 'string') &&
+    (value.approvalEdited === undefined || typeof value.approvalEdited === 'boolean') &&
+    (value.approvedAt === undefined || isDateString(value.approvedAt)) &&
+    (value.rejectedAt === undefined || isDateString(value.rejectedAt)) &&
+    (value.rejectionReason === undefined || typeof value.rejectionReason === 'string') &&
+    isDateString(value.createdAt) &&
+    isDateString(value.updatedAt)
+  )
+}
+
+function isAiDraftSourceMessage(value: unknown): value is AiDraftSourceMessage {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.text === 'string' &&
+    (value.timestamp === undefined || isDateString(value.timestamp)) &&
+    isDateString(value.createdAt)
+  )
+}
+
+function isAiDraftsResponse(value: unknown): value is AiDraftsResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    Array.isArray(value.drafts) &&
+    value.drafts.every(isAiReplyDraft) &&
+    isCatalogPagination(value.pagination)
+  )
+}
+
+function isAiDraftResponse(value: unknown): value is AiDraftResponse {
+  return isRecord(value) && value.success === true && isAiReplyDraft(value.draft)
+}
+
+function isAiDraftApprovalResponse(value: unknown): value is AiDraftApprovalResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    typeof value.message === 'string' &&
+    isRecord(value.draft) &&
+    typeof value.draft.id === 'string' &&
+    value.draft.status === 'approved' &&
+    typeof value.draft.approvedText === 'string'
+  )
+}
+
+function isAiDraftRejectionResponse(value: unknown): value is AiDraftRejectionResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    typeof value.message === 'string' &&
+    isRecord(value.draft) &&
+    typeof value.draft.id === 'string' &&
+    value.draft.status === 'rejected'
+  )
+}
+
+function isConversationResponseModeResponse(value: unknown): value is ConversationResponseModeResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    typeof value.message === 'string' &&
+    isRecord(value.conversation) &&
+    typeof value.conversation.id === 'string' &&
+    (value.conversation.responseMode === 'human' || value.conversation.responseMode === 'ai')
+  )
+}
+
+function isConversationResponseModeGetResponse(value: unknown): value is ConversationResponseModeGetResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    isRecord(value.conversation) &&
+    typeof value.conversation.id === 'string' &&
+    (value.conversation.responseMode === 'human' || value.conversation.responseMode === 'ai')
+  )
+}
+
 function safeErrorMessage(payload: unknown, status: number): string {
   if (isRecord(payload) && typeof payload.message === 'string') {
     const details = Array.isArray(payload.errors)
@@ -772,6 +949,81 @@ export function sendConversationMessage(
     `/conversations/${encodeURIComponent(conversationId)}/messages`,
     isSendConversationMessageResponse,
     { method: 'POST', body: JSON.stringify({ text }) },
+    true,
+  )
+}
+
+export function getAiDrafts(filters: AiDraftFilters = {}): Promise<AiDraftsResponse> {
+  const path = buildQuery('/ai-drafts', {
+    page: filters.page,
+    limit: filters.limit,
+    status: filters.status,
+  })
+  return requestJson(path, isAiDraftsResponse, {}, true)
+}
+
+export function getAiDraft(id: string): Promise<AiDraftResponse> {
+  return requestJson(`/ai-drafts/${encodeURIComponent(id)}`, isAiDraftResponse, {}, true)
+}
+
+export function getConversationAiDrafts(
+  conversationId: string,
+  filters: AiDraftFilters = {},
+): Promise<AiDraftsResponse> {
+  const path = buildQuery(`/conversations/${encodeURIComponent(conversationId)}/ai-drafts`, {
+    page: filters.page,
+    limit: filters.limit,
+    status: filters.status,
+  })
+  return requestJson(path, isAiDraftsResponse, {}, true)
+}
+
+export function approveAiDraft(
+  id: string,
+  approvedText?: string,
+): Promise<AiDraftApprovalResponse> {
+  return requestJson(
+    `/ai-drafts/${encodeURIComponent(id)}/approve`,
+    isAiDraftApprovalResponse,
+    {
+      method: 'POST',
+      body: JSON.stringify(approvedText === undefined ? {} : { approvedText }),
+    },
+    true,
+  )
+}
+
+export function rejectAiDraft(
+  id: string,
+  reason?: string,
+): Promise<AiDraftRejectionResponse> {
+  return requestJson(
+    `/ai-drafts/${encodeURIComponent(id)}/reject`,
+    isAiDraftRejectionResponse,
+    { method: 'POST', body: JSON.stringify(reason === undefined ? {} : { reason }) },
+    true,
+  )
+}
+
+export function updateConversationResponseMode(
+  conversationId: string,
+  responseMode: ConversationResponseMode,
+): Promise<ConversationResponseModeResponse> {
+  return requestJson(
+    `/conversations/${encodeURIComponent(conversationId)}/response-mode`,
+    isConversationResponseModeResponse,
+    { method: 'PATCH', body: JSON.stringify({ responseMode }) },
+    true,
+  )
+}
+
+export function getConversationResponseMode(
+  conversationId: string,
+): Promise<ConversationResponseModeGetResponse> {
+  return requestJson(
+    `/conversations/${encodeURIComponent(conversationId)}/response-mode`,
+    isConversationResponseModeGetResponse,
+    {},
     true,
   )
 }

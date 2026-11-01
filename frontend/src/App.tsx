@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { DashboardLayout } from './components/DashboardLayout'
 import { useAuth } from './context/AuthContext'
 import { BusinessProfilePage } from './pages/BusinessProfilePage'
+import { AiDraftsPage } from './pages/AiDraftsPage'
 import { CatalogPage } from './pages/CatalogPage'
 import { DashboardPage } from './pages/DashboardPage'
 import { FaqsPage } from './pages/FaqsPage'
@@ -12,6 +13,7 @@ import { RegisterPage } from './pages/RegisterPage'
 const dashboardRoutes = {
   '/dashboard': { title: 'Overview' },
   '/dashboard/inbox': { title: 'Inbox' },
+  '/dashboard/ai-drafts': { title: 'AI Drafts' },
   '/dashboard/business': { title: 'Business Profile' },
   '/dashboard/catalog': { title: 'Products & Services' },
   '/dashboard/faqs': { title: 'FAQs' },
@@ -83,6 +85,8 @@ function AppContent() {
       page = <BusinessProfilePage />
     } else if (routePath === '/dashboard/inbox') {
       page = <InboxPage />
+    } else if (routePath === '/dashboard/ai-drafts') {
+      page = <AiDraftsPage />
     } else if (routePath === '/dashboard/catalog') {
       page = <CatalogPage />
     } else if (routePath === '/dashboard/faqs') {

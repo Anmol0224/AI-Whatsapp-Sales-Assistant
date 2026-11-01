@@ -4,6 +4,7 @@ import { useAuth } from '../context/AuthContext'
 const navigationItems = [
   { label: 'Overview', href: '/dashboard', marker: 'OV' },
   { label: 'Inbox', href: '/dashboard/inbox', marker: 'IN' },
+  { label: 'AI Drafts', href: '/dashboard/ai-drafts', marker: 'AI' },
   { label: 'Business Profile', href: '/dashboard/business', marker: 'BP' },
   { label: 'Products & Services', href: '/dashboard/catalog', marker: 'PS' },
   { label: 'FAQs', href: '/dashboard/faqs', marker: 'FQ' },
