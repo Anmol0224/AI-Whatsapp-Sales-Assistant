@@ -180,7 +180,7 @@ faqsRouter.patch("/:id", async (request, response, next) => {
     const faq = await Faq.findOneAndUpdate(
       { _id: parsedId.data, businessId: auth.businessId },
       { $set: parsedBody.data },
-      { new: true, runValidators: true },
+      { returnDocument: "after", runValidators: true },
     );
 
     if (!faq) {
@@ -215,7 +215,7 @@ faqsRouter.delete("/:id", async (request, response, next) => {
     const faq = await Faq.findOneAndUpdate(
       { _id: parsedId.data, businessId: auth.businessId },
       { $set: { isActive: false } },
-      { new: true, runValidators: true },
+      { returnDocument: "after", runValidators: true },
     );
 
     if (!faq) {

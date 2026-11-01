@@ -283,7 +283,7 @@ async function persistIncomingTextMessage(
           ...(incoming.profileName ? { $set: { profileName: incoming.profileName } } : {}),
         };
         let customer = await Customer.findOneAndUpdate(customerFilter, customerUpdate, {
-          new: true,
+          returnDocument: "after",
           upsert: true,
           runValidators: true,
           setDefaultsOnInsert: true,
@@ -302,7 +302,7 @@ async function persistIncomingTextMessage(
             },
           },
           {
-            new: true,
+            returnDocument: "after",
             upsert: true,
             runValidators: true,
             setDefaultsOnInsert: true,

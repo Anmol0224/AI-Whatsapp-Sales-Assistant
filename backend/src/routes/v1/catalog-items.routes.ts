@@ -227,7 +227,7 @@ catalogItemsRouter.patch("/:id", async (request, response, next) => {
     const item = await CatalogItem.findOneAndUpdate(
       { _id: parsedId.data, businessId: auth.businessId },
       { $set: parsedBody.data },
-      { new: true, runValidators: true },
+      { returnDocument: "after", runValidators: true },
     );
 
     if (!item) {
@@ -262,7 +262,7 @@ catalogItemsRouter.delete("/:id", async (request, response, next) => {
     const item = await CatalogItem.findOneAndUpdate(
       { _id: parsedId.data, businessId: auth.businessId },
       { $set: { isActive: false } },
-      { new: true, runValidators: true },
+      { returnDocument: "after", runValidators: true },
     );
 
     if (!item) {

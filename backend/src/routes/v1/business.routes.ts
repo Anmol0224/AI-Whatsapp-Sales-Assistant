@@ -192,7 +192,7 @@ businessRouter.patch("/", async (request, response, next) => {
     const business = await Business.findOneAndUpdate(
       { _id: auth.businessId, ownerUserId: auth.userId },
       { $set: updates },
-      { new: true, runValidators: true },
+      { returnDocument: "after", runValidators: true },
     ).select(profileProjection);
 
     if (!business) {
@@ -264,7 +264,7 @@ businessRouter.patch("/whatsapp", async (request, response, next) => {
     const business = await Business.findOneAndUpdate(
       { _id: auth.businessId, ownerUserId: auth.userId },
       { $set: updates },
-      { new: true, runValidators: true },
+      { returnDocument: "after", runValidators: true },
     ).select(whatsappProjection);
 
     if (!business) {
