@@ -1,11 +1,14 @@
 import mongoose, { type HydratedDocument, type Model, type Types } from "mongoose";
 
 export type ConversationStatus = "open" | "closed";
+export type ConversationResponseMode = "human" | "ai";
 
 export interface ConversationFields {
   businessId: Types.ObjectId;
   customerId: Types.ObjectId;
   status: ConversationStatus;
+  responseMode: ConversationResponseMode;
+  aiControlVersion: number;
   lastMessageAt?: Date;
   lastMessagePreview?: string;
   createdAt: Date;
@@ -28,6 +31,22 @@ const conversationSchema = new mongoose.Schema<ConversationFields>(
       type: String,
       enum: ["open", "closed"],
       default: "open",
+      required: true,
+    },
+    responseMode: {
+      type: String,
+      enum: ["human", "ai"],
+      default: "human",
+      required: true,
+    },
+    aiControlVersion: {
+      type: Number,
+      min: 0,
+      default: 0,
+      validate: {
+        validator: (value: number) => Number.isSafeInteger(value),
+        message: "aiControlVersion must be a non-negative safe integer.",
+      },
       required: true,
     },
     lastMessageAt: { type: Date },

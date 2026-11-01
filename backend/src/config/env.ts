@@ -81,6 +81,31 @@ const environmentSchema = z.object({
   META_APP_SECRET: optionalSetting(
     z.string().trim().regex(/^[a-fA-F0-9]{32}$/, "must be a 32-character hexadecimal value"),
   ),
+  GEMINI_API_KEY: optionalSetting(
+    z
+      .string()
+      .trim()
+      .min(1)
+      .max(512)
+      .regex(/^\S+$/, "must not contain whitespace")
+      .refine((value) => !value.startsWith("REPLACE_WITH_"), {
+        message: "must be replaced with a valid Gemini API key",
+      }),
+  ),
+  GEMINI_MODEL: z
+    .string()
+    .trim()
+    .min(1)
+    .max(128)
+    .regex(/^[A-Za-z0-9._-]+$/, "must contain only letters, numbers, dots, underscores, or hyphens")
+    .default("gemini-3.8-flash"),
+  AI_DRAFT_WORKER_ENABLED: z
+    .preprocess(
+      (value) => typeof value === "string" ? value.trim().toLowerCase() : value,
+      z.enum(["true", "false"]).default("false"),
+    )
+    .transform((value) => value === "true"),
+  AI_DRAFT_WORKER_POLL_INTERVAL_MS: z.coerce.number().int().min(250).max(60_000).default(5_000),
 });
 
 const parsedEnvironment = environmentSchema.safeParse(process.env);
