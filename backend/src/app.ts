@@ -13,6 +13,7 @@ import healthRouter from "./routes/v1/health.routes.js";
 import whatsappWebhookRouter from "./routes/v1/whatsapp-webhook.routes.js";
 
 const app = express();
+app.set("trust proxy", 1);
 
 const corsOptions: CorsOptions = {
   origin(origin, callback) {
