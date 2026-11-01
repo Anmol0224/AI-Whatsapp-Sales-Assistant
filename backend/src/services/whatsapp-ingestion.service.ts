@@ -328,6 +328,7 @@ async function persistIncomingTextMessage(
         const conversationIsCurrent =
           conversation.lastMessageAt === undefined || messageAt >= conversation.lastMessageAt;
         const conversationUpdate: UpdateQuery<ConversationFields> = {
+          $inc: { aiControlVersion: 1 },
           $set: {
             status: "open",
             ...(conversationIsCurrent

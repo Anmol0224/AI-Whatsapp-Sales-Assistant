@@ -35,6 +35,7 @@ function makeTransitionHarness({ pauseAfterFence = null, failJobWriteOnce = fals
       businessId,
       conversationId,
       id: jobId,
+      inboundMessageId: new Types.ObjectId(),
       status: 'processing',
       attemptCount: 2,
       leaseExpiresAt: new Date(now.getTime() + 60_000),
@@ -82,10 +83,10 @@ function makeTransitionHarness({ pauseAfterFence = null, failJobWriteOnce = fals
     async incrementConversationFenceIfAi(input) {
       if (input.businessId.toString() !== state.conversation.businessId.toString() ||
         input.conversationId.toString() !== state.conversation.id.toString() ||
-        state.conversation.responseMode !== 'ai') return false
+        state.conversation.responseMode !== 'ai') return null
       state.conversation.aiControlVersion += 1
       await pauseAfterFence?.()
-      return true
+      return state.conversation.aiControlVersion
     },
     async saveJobIfCurrent(input) {
       if (shouldFailJobWrite) {
@@ -102,6 +103,7 @@ function makeTransitionHarness({ pauseAfterFence = null, failJobWriteOnce = fals
         state.job.leaseExpiresAt <= input.now) return false
       state.job.status = 'draft_ready'
       state.job.generatedDraft = input.draft
+      state.job.draftControlVersion = input.draftControlVersion
       state.job.leaseExpiresAt = null
       metrics.draftWrites += 1
       return true
@@ -109,12 +111,12 @@ function makeTransitionHarness({ pauseAfterFence = null, failJobWriteOnce = fals
     async takeOverConversation(input) {
       return withLock(async () => {
         if (input.businessId.toString() !== state.conversation.businessId.toString() ||
-          input.conversationId.toString() !== state.conversation.id.toString() ||
-          state.conversation.responseMode !== 'ai') return false
+          input.conversationId.toString() !== state.conversation.id.toString()) return { kind: 'not_found' }
+        if (state.conversation.responseMode !== 'ai') return { kind: 'already_human' }
         state.conversation.responseMode = 'human'
         state.conversation.aiControlVersion += 1
         metrics.takeoverWrites += 1
-        return true
+        return { kind: 'taken_over' }
       })
     },
     now: () => now,
@@ -143,7 +145,7 @@ test('draft transaction commits first and takeover afterward preserves the owner
   const { transitions, state, metrics } = makeTransitionHarness()
 
   assert.deepEqual(await transitions.saveDraft(draftInput()), { kind: 'saved' })
-  assert.equal(await transitions.takeOverConversation({ businessId, conversationId }), true)
+  assert.deepEqual(await transitions.takeOverConversation({ businessId, conversationId }), { kind: 'taken_over' })
   assert.equal(state.conversation.responseMode, 'human')
   assert.equal(state.conversation.aiControlVersion, 2)
   assert.equal(state.job.status, 'draft_ready')
@@ -154,7 +156,7 @@ test('draft transaction commits first and takeover afterward preserves the owner
 
 test('takeover commits first and prevents draft persistence', async () => {
   const { transitions, state, metrics } = makeTransitionHarness()
-  assert.equal(await transitions.takeOverConversation({ businessId, conversationId }), true)
+  assert.deepEqual(await transitions.takeOverConversation({ businessId, conversationId }), { kind: 'taken_over' })
 
   assert.deepEqual(await transitions.saveDraft(draftInput()), { kind: 'mode_changed' })
   assert.equal(state.conversation.responseMode, 'human')
@@ -178,7 +180,7 @@ test('concurrent draft and takeover serialize on the same conversation fence', a
   releaseFence()
 
   assert.deepEqual(await draftCommit, { kind: 'saved' })
-  assert.equal(await takeover, true)
+  assert.deepEqual(await takeover, { kind: 'taken_over' })
   assert.equal(state.job.status, 'draft_ready')
   assert.equal(state.conversation.responseMode, 'human')
   assert.equal(state.conversation.aiControlVersion, 2)
@@ -218,7 +220,7 @@ test('expired lease cannot persist a draft and rolls back the conversation fence
 test('another business cannot take over or fence this conversation', async () => {
   const { transitions, state, metrics } = makeTransitionHarness()
 
-  assert.equal(await transitions.takeOverConversation({ businessId: otherBusinessId, conversationId }), false)
+  assert.deepEqual(await transitions.takeOverConversation({ businessId: otherBusinessId, conversationId }), { kind: 'not_found' })
   assert.deepEqual(await transitions.saveDraft(draftInput({ businessId: otherBusinessId })), { kind: 'mode_changed' })
   assert.equal(state.conversation.responseMode, 'ai')
   assert.equal(state.conversation.aiControlVersion, 0)
@@ -230,7 +232,7 @@ test('a second takeover after draft completion leaves the completed draft intact
   const { transitions, state } = makeTransitionHarness()
   assert.deepEqual(await transitions.saveDraft(draftInput()), { kind: 'saved' })
 
-  assert.equal(await transitions.takeOverConversation({ businessId, conversationId }), true)
+  assert.deepEqual(await transitions.takeOverConversation({ businessId, conversationId }), { kind: 'taken_over' })
   assert.deepEqual(await transitions.saveDraft(draftInput()), { kind: 'mode_changed' })
   assert.equal(state.job.status, 'draft_ready')
   assert.equal(state.job.generatedDraft, 'Suggested reply')
@@ -253,7 +255,7 @@ test('production transaction adapter passes the same Mongo session and full owne
 
   try {
     mongoose.startSession = async () => session
-    Conversation.findOneAndUpdate = (...args) => { calls.conversation = args; return query({ _id: conversationId }) }
+    Conversation.findOneAndUpdate = (...args) => { calls.conversation = args; return query({ _id: conversationId, aiControlVersion: 1 }) }
     AiReplyJob.findOneAndUpdate = (...args) => { calls.job = args; return query({ _id: jobId }) }
 
     assert.deepEqual(
@@ -264,6 +266,8 @@ test('production transaction adapter passes the same Mongo session and full owne
     assert.equal(calls.conversation[0]._id, conversationId)
     assert.equal(calls.conversation[0].responseMode, 'ai')
     assert.deepEqual(calls.conversation[1], { $inc: { aiControlVersion: 1 } })
+    assert.equal(calls.conversation[0].responseMode, 'ai')
+    assert.ok(Array.isArray(calls.conversation[0].$or))
     assert.equal(calls.conversation[2].session, session)
     assert.equal(calls.job[0].businessId, businessId)
     assert.equal(calls.job[0].conversationId, conversationId)
@@ -272,11 +276,12 @@ test('production transaction adapter passes the same Mongo session and full owne
     assert.equal(calls.job[0].leaseExpiresAt.$gt instanceof Date, true)
     assert.ok(Math.abs(calls.job[0].leaseExpiresAt.$gt.getTime() - Date.now()) < 5_000)
     assert.equal(calls.job[0].status, 'processing')
+    assert.equal(calls.job[1].$set.draftControlVersion, 1)
     assert.equal(calls.job[2].session, session)
     assert.equal(calls.ended, true)
 
     Conversation.findOneAndUpdate = (...args) => { calls.conversation = args; return query({ _id: conversationId }) }
-    assert.equal(await takeOverConversation(businessId, conversationId), true)
+    assert.deepEqual(await takeOverConversation(businessId, conversationId), { kind: 'taken_over' })
     assert.equal(calls.conversation[0].businessId, businessId)
     assert.equal(calls.conversation[0]._id, conversationId)
     assert.equal(calls.conversation[0].responseMode, 'ai')

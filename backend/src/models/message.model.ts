@@ -8,6 +8,7 @@ export interface MessageFields {
   businessId: Types.ObjectId;
   conversationId: Types.ObjectId;
   customerId: Types.ObjectId;
+  aiReplyJobId?: Types.ObjectId;
   direction: MessageDirection;
   messageType: MessageType;
   text: string;
@@ -37,6 +38,10 @@ const messageSchema = new mongoose.Schema<MessageFields>(
       type: mongoose.Schema.Types.ObjectId,
       ref: "Customer",
       required: true,
+    },
+    aiReplyJobId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "AiReplyJob",
     },
     direction: {
       type: String,
@@ -92,6 +97,14 @@ messageSchema.index(
 messageSchema.index(
   { businessId: 1, createdAt: -1 },
   { name: "messages_business_created_at" },
+);
+messageSchema.index(
+  { businessId: 1, aiReplyJobId: 1 },
+  {
+    unique: true,
+    name: "messages_business_ai_reply_job_unique",
+    partialFilterExpression: { aiReplyJobId: { $type: "objectId" } },
+  },
 );
 
 export type MessageDocument = HydratedDocument<MessageFields>;

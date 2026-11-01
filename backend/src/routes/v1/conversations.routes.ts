@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type RequestHandler } from "express";
 import { Types } from "mongoose";
 import { z } from "zod";
 import { authenticate } from "../../middleware/auth.middleware.js";
@@ -10,6 +10,7 @@ import {
   sendWhatsAppTextMessage,
   WhatsAppCloudApiError,
 } from "../../services/whatsapp-cloud-api.service.js";
+import { setConversationResponseMode } from "../../services/ai-reply-job.repository.js";
 
 const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i);
 const paginationSchema = z
@@ -24,6 +25,9 @@ const paginationSchema = z
   });
 const sendMessageBodySchema = z
   .object({ text: z.string().trim().min(1).max(4096) })
+  .strict();
+const responseModeBodySchema = z
+  .object({ responseMode: z.enum(["human", "ai"]) })
   .strict();
 
 interface ConversationRecord {
@@ -86,6 +90,15 @@ export interface ConversationsRouteDependencies {
     businessId: Types.ObjectId,
     summary: ConversationSummaryUpdate,
   ): Promise<boolean>;
+  getResponseMode(
+    conversationId: Types.ObjectId,
+    businessId: Types.ObjectId,
+  ): Promise<{ responseMode: "human" | "ai" } | null>;
+  changeResponseMode(
+    businessId: Types.ObjectId,
+    conversationId: Types.ObjectId,
+    responseMode: "human" | "ai",
+  ): ReturnType<typeof setConversationResponseMode>;
 }
 
 const mongooseDependencies: ConversationsRouteDependencies = {
@@ -194,6 +207,12 @@ const mongooseDependencies: ConversationsRouteDependencies = {
     );
     return result.matchedCount === 1;
   },
+  getResponseMode: async (conversationId, businessId) =>
+    Conversation.findOne({ _id: conversationId, businessId })
+      .select({ _id: 1, responseMode: 1 })
+      .lean<{ responseMode: "human" | "ai" }>()
+      .exec(),
+  changeResponseMode: setConversationResponseMode,
 };
 
 function validationErrors(issues: z.ZodIssue[]) {
@@ -271,9 +290,107 @@ function mayHaveBeenAccepted(response: import("express").Response): void {
 
 export function createConversationsRouter(
   dependencies: ConversationsRouteDependencies = mongooseDependencies,
+  authentication: RequestHandler = authenticate,
 ) {
   const conversationsRouter = Router();
-  conversationsRouter.use(authenticate);
+  conversationsRouter.use(authentication);
+
+  conversationsRouter.get("/:conversationId/response-mode", async (request, response, next) => {
+    const auth = request.auth;
+    if (!auth) {
+      response.status(401).json({ success: false, message: "Authentication required." });
+      return;
+    }
+
+    const parsedId = objectIdSchema.safeParse(request.params.conversationId);
+    if (!parsedId.success) {
+      response.status(400).json({ success: false, message: "Invalid conversation ID." });
+      return;
+    }
+
+    try {
+      const conversation = await dependencies.getResponseMode(
+        new Types.ObjectId(parsedId.data),
+        new Types.ObjectId(auth.businessId),
+      );
+      if (!conversation) {
+        response.status(404).json({ success: false, message: "Conversation not found." });
+        return;
+      }
+
+      response.status(200).json({
+        success: true,
+        conversation: { id: parsedId.data, responseMode: conversation.responseMode },
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  conversationsRouter.patch("/:conversationId/response-mode", async (request, response, next) => {
+    const auth = request.auth;
+    if (!auth) {
+      response.status(401).json({ success: false, message: "Authentication required." });
+      return;
+    }
+
+    const parsedId = objectIdSchema.safeParse(request.params.conversationId);
+    if (!parsedId.success) {
+      response.status(400).json({ success: false, message: "Invalid conversation ID." });
+      return;
+    }
+
+    const parsedBody = responseModeBodySchema.safeParse(request.body);
+    if (!parsedBody.success) {
+      response.status(400).json({
+        success: false,
+        message: "Invalid conversation response mode.",
+        errors: validationErrors(parsedBody.error.issues),
+      });
+      return;
+    }
+
+    try {
+      const result = await dependencies.changeResponseMode(
+        new Types.ObjectId(auth.businessId),
+        new Types.ObjectId(parsedId.data),
+        parsedBody.data.responseMode,
+      );
+      if (result.kind === "not_found") {
+        response.status(404).json({ success: false, message: "Conversation not found." });
+        return;
+      }
+      if (result.kind === "send_in_progress") {
+        response.status(409).json({
+          success: false,
+          message: "A WhatsApp send is already in progress for this conversation.",
+          code: "send_in_progress",
+        });
+        return;
+      }
+      if (result.kind === "conflict") {
+        response.status(409).json({
+          success: false,
+          message: "Conversation response mode could not be changed.",
+          code: "conflict",
+        });
+        return;
+      }
+
+      response.status(200).json({
+        success: true,
+        message: result.kind === "already_set"
+          ? "Conversation response mode is already set."
+          : "Conversation response mode updated successfully.",
+        conversation: {
+          id: parsedId.data,
+          responseMode: result.responseMode,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  });
 
   conversationsRouter.get("/", async (request, response, next) => {
     const auth = request.auth;

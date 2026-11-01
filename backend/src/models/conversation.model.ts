@@ -9,6 +9,7 @@ export interface ConversationFields {
   status: ConversationStatus;
   responseMode: ConversationResponseMode;
   aiControlVersion: number;
+  activeAiSendJobId?: Types.ObjectId;
   lastMessageAt?: Date;
   lastMessagePreview?: string;
   createdAt: Date;
@@ -48,6 +49,10 @@ const conversationSchema = new mongoose.Schema<ConversationFields>(
         message: "aiControlVersion must be a non-negative safe integer.",
       },
       required: true,
+    },
+    activeAiSendJobId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "AiReplyJob",
     },
     lastMessageAt: { type: Date },
     lastMessagePreview: {
