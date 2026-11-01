@@ -1,9 +1,11 @@
 import mongoose, { Types, type UpdateQuery } from "mongoose";
 import { z } from "zod";
+import { env } from "../config/env.js";
 import { Business } from "../models/business.model.js";
 import { Conversation, type ConversationFields } from "../models/conversation.model.js";
 import { Customer, type CustomerFields } from "../models/customer.model.js";
 import { Message, type MessageFields } from "../models/message.model.js";
+import { createAiReplyJobInSession } from "./ai-reply-job.repository.js";
 
 const phoneNumberSchema = z
   .string()
@@ -110,6 +112,7 @@ export interface WhatsAppIngestionRepository {
   persistIncomingTextMessage(
     businessId: string,
     message: IncomingWhatsAppTextMessage,
+    aiDraftWorkerEnabled: boolean,
   ): Promise<"inserted" | "duplicate" | "unmapped">;
   updateOutgoingMessageStatus(
     businessId: string,
@@ -243,6 +246,7 @@ async function findStoredMessage(
 async function persistIncomingTextMessage(
   businessId: string,
   incoming: IncomingWhatsAppTextMessage,
+  aiDraftWorkerEnabled: boolean,
 ): Promise<"inserted" | "duplicate" | "unmapped"> {
   if (!incoming.phoneNumberId) return "unmapped";
 
@@ -255,6 +259,7 @@ async function persistIncomingTextMessage(
 
     try {
       await session.withTransaction(async () => {
+        result = undefined;
         const business = await Business.findOne({
           _id: businessObjectId,
           "whatsapp.phoneNumberId": incoming.phoneNumberId,
@@ -348,6 +353,15 @@ async function persistIncomingTextMessage(
           throw new Error("Conversation changed during message persistence.");
         }
 
+        if (aiDraftWorkerEnabled && conversation.responseMode === "ai") {
+          await createAiReplyJobInSession({
+            businessId: businessObjectId,
+            conversationId: conversation._id,
+            inboundMessageId: createdMessage._id,
+            session,
+          });
+        }
+
         result = "inserted";
       });
 
@@ -437,6 +451,7 @@ const mongooseRepository: WhatsAppIngestionRepository = {
 export async function ingestWhatsAppPayload(
   payload: unknown,
   repository: WhatsAppIngestionRepository = mongooseRepository,
+  options: { aiDraftWorkerEnabled?: boolean } = {},
 ): Promise<IngestionResult> {
   const parsed = parseWhatsAppPayload(payload);
   if (parsed.kind !== "events") return parsed;
@@ -455,7 +470,11 @@ export async function ingestWhatsAppPayload(
     }
     if (!businessId) continue;
 
-    const persistenceResult = await repository.persistIncomingTextMessage(businessId, message);
+    const persistenceResult = await repository.persistIncomingTextMessage(
+      businessId,
+      message,
+      options.aiDraftWorkerEnabled ?? env.AI_DRAFT_WORKER_ENABLED,
+    );
     if (persistenceResult === "inserted") inserted += 1;
     else if (persistenceResult === "duplicate") duplicates += 1;
   }

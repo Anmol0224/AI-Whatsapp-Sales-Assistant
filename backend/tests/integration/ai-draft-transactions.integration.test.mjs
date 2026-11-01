@@ -94,6 +94,13 @@ after(async () => {
           cleanupFailed = true;
         }
       }
+      if (createdIds.businesses.length > 0) {
+        try {
+          await AiReplyJob.deleteMany({ businessId: { $in: createdIds.businesses } }).exec();
+        } catch {
+          cleanupFailed = true;
+        }
+      }
       for (const id of createdIds.messages) {
         try {
           await Message.deleteOne({ _id: id }).exec();
@@ -242,7 +249,7 @@ async function createIngestionWorkspace(options = {}) {
       businessId,
       customerId,
       status: "open",
-      responseMode: "ai",
+      responseMode: options.responseMode ?? "ai",
       aiControlVersion: 0,
     });
   }
@@ -679,6 +686,7 @@ test("concurrent distinct inbound messages both persist and increment the fence"
   await assertRequiredUniqueIndex(Message, "messages_business_provider_id_unique", { businessId: 1, providerMessageId: 1 }, {
     providerMessageId: { $type: "string", $gt: "" },
   });
+  await assertRequiredUniqueIndex(AiReplyJob, "ai_reply_jobs_business_inbound_unique", { businessId: 1, inboundMessageId: 1 });
   const workspace = await createIngestionWorkspace();
   const matcher = (query) => query.model?.modelName === "Customer" &&
     query.op === "findOneAndUpdate" &&
@@ -687,8 +695,8 @@ test("concurrent distinct inbound messages both persist and increment the fence"
 
   const settled = await withMongoCommandBarrier("distinct inbound customer upserts", matcher, () =>
     Promise.allSettled([
-      ingestWhatsAppPayload(incomingTextPayload(workspace, `wamid.concurrent-a-${new Types.ObjectId()}`, "First concurrent inbound")),
-      ingestWhatsAppPayload(incomingTextPayload(workspace, `wamid.concurrent-b-${new Types.ObjectId()}`, "Second concurrent inbound")),
+      ingestWhatsAppPayload(incomingTextPayload(workspace, `wamid.concurrent-a-${new Types.ObjectId()}`, "First concurrent inbound"), undefined, { aiDraftWorkerEnabled: true }),
+      ingestWhatsAppPayload(incomingTextPayload(workspace, `wamid.concurrent-b-${new Types.ObjectId()}`, "Second concurrent inbound"), undefined, { aiDraftWorkerEnabled: true }),
     ]),
   );
   const results = assertConcurrentOperationsFulfilled("distinct inbound messages", settled);
@@ -697,7 +705,7 @@ test("concurrent distinct inbound messages both persist and increment the fence"
     { kind: "accepted", inserted: 1, duplicates: 0 },
   ]);
 
-  const [messages, conversation, customers, conversations] = await Promise.all([
+  const [messages, conversation, customers, conversations, jobs] = await Promise.all([
     Message.find({ businessId: workspace.businessId, conversationId: workspace.conversationId, direction: "inbound" })
       .select({ _id: 1, providerMessageId: 1 })
       .lean()
@@ -708,12 +716,161 @@ test("concurrent distinct inbound messages both persist and increment the fence"
       .exec(),
     Customer.find({ businessId: workspace.businessId, phoneNumber: workspace.phoneNumber }).select({ _id: 1 }).lean().exec(),
     Conversation.find({ businessId: workspace.businessId, customerId: workspace.customerId }).select({ _id: 1 }).lean().exec(),
+    AiReplyJob.find({ businessId: workspace.businessId, conversationId: workspace.conversationId })
+      .select({ _id: 1, inboundMessageId: 1, status: 1 })
+      .lean()
+      .exec(),
   ]);
+  createdIds.jobs.push(...jobs.map((job) => job._id));
   assert.equal(messages.length, 2);
   assert.equal(new Set(messages.map((message) => message.providerMessageId)).size, 2);
   assert.equal(conversation?.aiControlVersion, 2);
   assert.equal(customers.length, 1);
   assert.equal(conversations.length, 1);
+  assert.equal(jobs.length, 2);
+  assert.ok(jobs.every((job) => job.status === "queued"));
+  assert.deepEqual(
+    new Set(jobs.map((job) => job.inboundMessageId.toString())),
+    new Set(messages.map((message) => message._id.toString())),
+  );
+});
+
+test("real ingestion transaction commits an inbound message, fence and queued AI job together", async () => {
+  await assertRequiredUniqueIndex(AiReplyJob, "ai_reply_jobs_business_inbound_unique", { businessId: 1, inboundMessageId: 1 });
+  const workspace = await createIngestionWorkspace({ responseMode: "ai" });
+  const result = await ingestWhatsAppPayload(
+    incomingTextPayload(workspace, `wamid.atomic-job-${new Types.ObjectId()}`),
+    undefined,
+    { aiDraftWorkerEnabled: true },
+  );
+  assert.deepEqual(result, { kind: "accepted", inserted: 1, duplicates: 0 });
+
+  const [message, conversation, jobs] = await Promise.all([
+    Message.findOne({ businessId: workspace.businessId, direction: "inbound" })
+      .select({ _id: 1, conversationId: 1 })
+      .lean()
+      .exec(),
+    Conversation.findOne({ businessId: workspace.businessId })
+      .select({ _id: 1, aiControlVersion: 1, responseMode: 1 })
+      .lean()
+      .exec(),
+    AiReplyJob.find({ businessId: workspace.businessId })
+      .select({ _id: 1, conversationId: 1, inboundMessageId: 1, status: 1 })
+      .lean()
+      .exec(),
+  ]);
+  createdIds.jobs.push(...jobs.map((job) => job._id));
+  assert.ok(message);
+  assert.ok(conversation);
+  assert.equal(conversation.responseMode, "ai");
+  assert.equal(conversation.aiControlVersion, 1);
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].status, "queued");
+  assert.equal(jobs[0].conversationId.toString(), conversation._id.toString());
+  assert.equal(jobs[0].inboundMessageId.toString(), message._id.toString());
+});
+
+test("real ingestion transaction rolls back inbound persistence when queued job creation fails", async () => {
+  await assertRequiredUniqueIndex(AiReplyJob, "ai_reply_jobs_business_inbound_unique", { businessId: 1, inboundMessageId: 1 });
+  const workspace = await createIngestionWorkspace({ responseMode: "ai" });
+  const originalCreate = AiReplyJob.create;
+  let injectedFailure = false;
+  AiReplyJob.create = async function (documents, options) {
+    const result = await originalCreate.call(this, documents, options);
+    if (!injectedFailure) {
+      injectedFailure = true;
+      throw new Error("Injected transactional AI job creation failure");
+    }
+    return result;
+  };
+
+  try {
+    await assert.rejects(
+      ingestWhatsAppPayload(
+        incomingTextPayload(workspace, `wamid.rollback-job-${new Types.ObjectId()}`),
+        undefined,
+        { aiDraftWorkerEnabled: true },
+      ),
+    );
+  } finally {
+    AiReplyJob.create = originalCreate;
+  }
+
+  assert.equal(injectedFailure, true, "AI reply job creation failure should be reached");
+
+  const [messages, customers, conversations, jobs] = await Promise.all([
+    Message.find({ businessId: workspace.businessId }).select({ _id: 1 }).lean().exec(),
+    Customer.find({ _id: workspace.customerId, businessId: workspace.businessId }).select({ _id: 1 }).lean().exec(),
+    Conversation.find({ _id: workspace.conversationId, businessId: workspace.businessId })
+      .select({ _id: 1, responseMode: 1, aiControlVersion: 1 })
+      .lean()
+      .exec(),
+    AiReplyJob.find({ businessId: workspace.businessId }).select({ _id: 1 }).lean().exec(),
+  ]);
+  createdIds.jobs.push(...jobs.map((job) => job._id));
+  assert.equal(messages.length, 0);
+  assert.equal(customers.length, 1);
+  assert.equal(conversations.length, 1);
+  assert.equal(conversations[0].responseMode, "ai");
+  assert.equal(conversations[0].aiControlVersion, 0);
+  assert.equal(jobs.length, 0);
+});
+
+test("Human takeover committed before inbound conversation fencing prevents a queued AI job", async () => {
+  await assertRequiredUniqueIndex(AiReplyJob, "ai_reply_jobs_business_inbound_unique", { businessId: 1, inboundMessageId: 1 });
+  const workspace = await createIngestionWorkspace();
+  let releaseIngestion;
+  let reachedFence;
+  const atFence = new Promise((resolve) => { reachedFence = resolve; });
+  const ingestionMayContinue = new Promise((resolve) => { releaseIngestion = resolve; });
+  const originalExec = mongoose.Query.prototype.exec;
+  let intercepted = false;
+
+  mongoose.Query.prototype.exec = async function (...args) {
+    if (!intercepted && this.model?.modelName === "Conversation" && this.op === "updateOne" &&
+      this._conditions?._id?.toString() === workspace.conversationId.toString() &&
+      this._update?.$inc?.aiControlVersion === 1) {
+      intercepted = true;
+      reachedFence();
+      await ingestionMayContinue;
+    }
+    return originalExec.apply(this, args);
+  };
+
+  let ingestionPromise;
+  try {
+    ingestionPromise = ingestWhatsAppPayload(
+      incomingTextPayload(workspace, `wamid.takeover-${new Types.ObjectId()}`),
+      undefined,
+      { aiDraftWorkerEnabled: true },
+    );
+    await atFence;
+    assert.deepEqual(await takeOverConversation(workspace.businessId, workspace.conversationId), { kind: "taken_over" });
+  } finally {
+    releaseIngestion();
+    mongoose.Query.prototype.exec = originalExec;
+  }
+
+  assert.deepEqual(await ingestionPromise, { kind: "accepted", inserted: 1, duplicates: 0 });
+  const [conversation, messages, jobs] = await Promise.all([
+    Conversation.findOne({ _id: workspace.conversationId, businessId: workspace.businessId })
+      .select({ _id: 1, responseMode: 1, aiControlVersion: 1 })
+      .lean()
+      .exec(),
+    Message.find({ businessId: workspace.businessId, conversationId: workspace.conversationId, direction: "inbound" })
+      .select({ _id: 1 })
+      .lean()
+      .exec(),
+    AiReplyJob.find({ businessId: workspace.businessId, conversationId: workspace.conversationId })
+      .select({ _id: 1 })
+      .lean()
+      .exec(),
+  ]);
+  createdIds.jobs.push(...jobs.map((job) => job._id));
+  assert.equal(conversation?.responseMode, "human");
+  assert.equal(conversation?.aiControlVersion, 2);
+  assert.equal(messages.length, 1);
+  assert.equal(jobs.length, 0);
 });
 
 test("inbound persistence racing approval never leaves a stale draft reservable", async () => {

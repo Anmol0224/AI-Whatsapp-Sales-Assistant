@@ -167,6 +167,13 @@ export interface CreateAiReplyJobResult {
   created: boolean;
 }
 
+export interface CreateAiReplyJobInSessionInput {
+  businessId: Types.ObjectId;
+  conversationId: Types.ObjectId;
+  inboundMessageId: Types.ObjectId;
+  session: ClientSession;
+}
+
 function isDuplicateKeyError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === 11000;
 }
@@ -211,6 +218,61 @@ export async function createOrGetAiReplyJob(
     if (!existing) throw error;
     return { job: existing, created: false };
   }
+}
+
+/** Creates or confirms an eligible inbound job inside the caller's message-persistence transaction. */
+export async function createAiReplyJobInSession(
+  input: CreateAiReplyJobInSessionInput,
+): Promise<"created" | "exists"> {
+  const conversation = await Conversation.findOne({
+    _id: input.conversationId,
+    businessId: input.businessId,
+    responseMode: "ai",
+  })
+    .select({ _id: 1 })
+    .session(input.session)
+    .lean()
+    .exec();
+  if (!conversation) {
+    throw new Error("AI_REPLY_JOB_REFERENCE_NOT_FOUND");
+  }
+
+  const inboundMessage = await Message.findOne({
+    _id: input.inboundMessageId,
+    businessId: input.businessId,
+    conversationId: input.conversationId,
+    direction: "inbound",
+  })
+    .select({ _id: 1 })
+    .session(input.session)
+    .lean()
+    .exec();
+  if (!inboundMessage) throw new Error("AI_REPLY_JOB_REFERENCE_NOT_FOUND");
+
+  const existingJob = await AiReplyJob.findOne({
+    businessId: input.businessId,
+    inboundMessageId: input.inboundMessageId,
+  })
+    .select({ _id: 1, conversationId: 1 })
+    .session(input.session)
+    .lean<{ conversationId: Types.ObjectId }>()
+    .exec();
+
+  if (existingJob) {
+    if (!existingJob.conversationId.equals(input.conversationId)) {
+      throw new Error("AI_REPLY_JOB_REFERENCE_CONFLICT");
+    }
+    return "exists";
+  }
+
+  await AiReplyJob.create([{
+    businessId: input.businessId,
+    conversationId: input.conversationId,
+    inboundMessageId: input.inboundMessageId,
+    status: "queued",
+  }], { session: input.session });
+
+  return "created";
 }
 
 /** Atomically claims one due job for this business. attemptCount acts as a fencing token for completion. */
