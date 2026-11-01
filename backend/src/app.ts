@@ -53,10 +53,45 @@ function rejectCompressedWebhookBodies(
   next();
 }
 
+function logWebhookVerificationRequest(
+  request: express.Request,
+  response: express.Response,
+  next: express.NextFunction,
+): void {
+  if (request.method !== "GET") {
+    next();
+    return;
+  }
+
+  const pathname = request.originalUrl.split("?")[0] || "/";
+  if (
+    pathname !== "/api/v1/webhooks/whatsapp" &&
+    pathname !== "/api/v1/webhooks/whatsapp/"
+  ) {
+    next();
+    return;
+  }
+
+  response.once("finish", () => {
+    console.info(
+      JSON.stringify({
+        timestamp: new Date().toISOString(),
+        method: request.method,
+        pathname,
+        statusCode: response.statusCode,
+        verification: response.statusCode === 200 ? "succeeded" : "failed",
+      }),
+    );
+  });
+
+  next();
+}
+
 app.use(helmet());
 app.use(cors(corsOptions));
 app.use(
   "/api/v1/webhooks/whatsapp",
+  logWebhookVerificationRequest,
   apiRateLimiter,
   rejectCompressedWebhookBodies,
   express.raw({ type: "application/json", limit: "100kb", inflate: false }),
