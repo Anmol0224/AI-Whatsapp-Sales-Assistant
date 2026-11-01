@@ -28,6 +28,30 @@ function matchesVerificationToken(provided: string, configured: string): boolean
   );
 }
 
+export function getWhatsAppVerificationDiagnostics(query: unknown) {
+  const queryValues =
+    typeof query === "object" && query !== null
+      ? (query as Record<string, unknown>)
+      : {};
+  const providedToken = queryValues["hub.verify_token"];
+  const challenge = queryValues["hub.challenge"];
+  const configuredToken = env.WHATSAPP_VERIFY_TOKEN;
+
+  return {
+    modePresent: Object.prototype.hasOwnProperty.call(queryValues, "hub.mode"),
+    modeIsSubscribe: queryValues["hub.mode"] === "subscribe",
+    verifyTokenPresent: Object.prototype.hasOwnProperty.call(
+      queryValues,
+      "hub.verify_token",
+    ),
+    tokenMatchesConfigured:
+      typeof providedToken === "string" &&
+      configuredToken !== undefined &&
+      matchesVerificationToken(providedToken, configuredToken),
+    challengePresent: typeof challenge === "string" && challenge.length > 0,
+  };
+}
+
 export function createWhatsAppWebhookRouter(ingest: PayloadIngester = ingestWhatsAppPayload) {
   const whatsappWebhookRouter = Router();
 

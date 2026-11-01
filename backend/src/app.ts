@@ -10,7 +10,9 @@ import catalogItemsRouter from "./routes/v1/catalog-items.routes.js";
 import conversationsRouter from "./routes/v1/conversations.routes.js";
 import faqsRouter from "./routes/v1/faqs.routes.js";
 import healthRouter from "./routes/v1/health.routes.js";
-import whatsappWebhookRouter from "./routes/v1/whatsapp-webhook.routes.js";
+import whatsappWebhookRouter, {
+  getWhatsAppVerificationDiagnostics,
+} from "./routes/v1/whatsapp-webhook.routes.js";
 
 const app = express();
 
@@ -72,6 +74,8 @@ function logWebhookVerificationRequest(
     return;
   }
 
+  const diagnostics = getWhatsAppVerificationDiagnostics(request.query);
+
   response.once("finish", () => {
     console.info(
       JSON.stringify({
@@ -80,6 +84,11 @@ function logWebhookVerificationRequest(
         pathname,
         statusCode: response.statusCode,
         verification: response.statusCode === 200 ? "succeeded" : "failed",
+        modePresent: diagnostics.modePresent,
+        modeIsSubscribe: diagnostics.modeIsSubscribe,
+        verifyTokenPresent: diagnostics.verifyTokenPresent,
+        tokenMatchesConfigured: diagnostics.tokenMatchesConfigured,
+        challengePresent: diagnostics.challengePresent,
       }),
     );
   });
