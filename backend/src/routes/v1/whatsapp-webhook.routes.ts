@@ -14,8 +14,7 @@ const verificationQuerySchema = z
     "hub.mode": z.string().optional(),
     "hub.verify_token": z.string().optional(),
     "hub.challenge": z.string().optional(),
-  })
-  .strict();
+  });
 
 function matchesVerificationToken(provided: string, configured: string): boolean {
   const providedBytes = Buffer.from(provided, "utf8");
