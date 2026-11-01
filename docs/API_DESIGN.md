@@ -241,7 +241,90 @@ Ignored events or events with no resolvable business use `"Webhook event ignored
 |---|---|---|---|
 | `GET` | `/api/v1/conversations` | JWT | List conversations for the authenticated business. |
 | `GET` | `/api/v1/conversations/:conversationId/messages` | JWT | Read paginated messages for one owned conversation. |
+| `GET` | `/api/v1/conversations/:conversationId/response-mode` | JWT | Read the response mode of one owned conversation without changing it. |
 | `POST` | `/api/v1/conversations/:conversationId/messages` | JWT | Send a text message to the customer in an existing conversation. |
+| `PATCH` | `/api/v1/conversations/:conversationId/response-mode` | JWT | Switch the owned conversation between human and AI response modes. |
+
+### AI draft retrieval
+
+| Method | Endpoint | Auth | Purpose |
+|---|---|---|---|
+| `GET` | `/api/v1/ai-drafts` | JWT | List review-safe AI reply job summaries for the authenticated business. |
+| `GET` | `/api/v1/ai-drafts/:draftId` | JWT | Retrieve one review-safe draft for the authenticated business. |
+| `GET` | `/api/v1/conversations/:conversationId/ai-drafts` | JWT | List drafts for one conversation owned by the authenticated business. |
+| `POST` | `/api/v1/ai-drafts/:draftId/approve` | JWT | Approve the generated or owner-edited draft for later controlled sending. |
+| `POST` | `/api/v1/ai-drafts/:draftId/reject` | JWT | Reject a draft awaiting owner review. |
+
+All three endpoints derive `businessId` from the JWT. The list endpoints accept `page` (default `1`), `limit` (default `20`, maximum `100`), and an optional `status`. If omitted, status defaults to `draft_ready`. Supported status values are `queued`, `processing`, `draft_ready`, `approved`, `rejected`, `sending`, `sent`, `send_failed`, `send_uncertain`, `failed`, and `cancelled`. Invalid IDs or query values return `400`; unknown query parameters are rejected. Pagination is sorted by `createdAt` descending, then `_id` descending, with `totalPages: 0` for an empty result.
+
+List response (`200`):
+
+```json
+{
+  "success": true,
+  "drafts": [
+    {
+      "id": "draft-id",
+      "conversationId": "conversation-id",
+      "sourceMessage": {
+        "id": "inbound-message-id",
+        "text": "Do you have this in blue?",
+        "timestamp": "2026-11-01T09:59:00.000Z",
+        "createdAt": "2026-11-01T10:00:00.000Z"
+      },
+      "status": "draft_ready",
+      "generatedDraft": "Thanks for your enquiry. The item is available.",
+      "createdAt": "2026-11-01T10:00:00.000Z",
+      "updatedAt": "2026-11-01T10:00:00.000Z"
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "limit": 20,
+    "totalItems": 1,
+    "totalPages": 1
+  }
+}
+```
+
+`sourceMessage` is the exact persisted inbound message referenced by the draft's `inboundMessageId`. It contains only the message ID, text, optional provider timestamp, and creation time. The lookup is scoped by the authenticated business, inbound direction, and the draft's conversation. If the source message is missing or cannot be matched safely, the field is `null`; the API does not substitute a timestamp-based message. `GET /api/v1/ai-drafts/:draftId` returns `{ "success": true, "draft": { ... } }` with the same safe draft fields. Optional review fields include `approvedText`, `approvalEdited`, `approvedAt`, `rejectedAt`, and `rejectionReason`. Neither list nor detail responses expose MongoDB documents, attempt counts, worker leases, send attempt IDs, provider IDs, provider error details, or credentials. The conversation endpoint first verifies that the conversation belongs to the authenticated business and returns `404` with `"Conversation not found."` otherwise. A draft ID that is missing or belongs to another business returns the same `404` response: `{"success":false,"message":"AI draft not found."}`.
+
+These endpoints provide authenticated owner review and response-mode controls. All derive business and user identity from the JWT; client-supplied identity fields are rejected. No route in this section sends a WhatsApp message or calls Gemini.
+
+### AI draft approval and rejection
+
+| Method | Endpoint | Auth | Purpose |
+|---|---|---|---|
+| `POST` | `/api/v1/ai-drafts/:draftId/approve` | JWT | Approve an unchanged generated draft or an owner-edited version. |
+| `POST` | `/api/v1/ai-drafts/:draftId/reject` | JWT | Reject a draft awaiting owner review. |
+
+Both endpoints validate the ObjectId path parameter and reject unknown body fields. Approval accepts `{}` to approve the generated text or `{ "approvedText": "..." }` to approve edited text. `approvedText` is trimmed, required to be non-empty when provided, and limited to 4,096 characters. Rejection accepts an optional `{ "reason": "..." }`, trimmed and limited to 500 characters.
+
+Approval is a transactional, one-time transition. It requires the job to remain `draft_ready`, its conversation to remain in AI mode, and the source inbound message to remain the latest committed inbound message for that business and conversation. “Latest” is determined by persisted `createdAt` descending, then `_id` descending. The persisted inbound-message transaction increments the same conversation `aiControlVersion`; the draft records its version, and approval compares that fence before recording the owner, time, approved text, edit flag, and approved control version. Human takeover and switching response mode also advance the fence. A stale draft returns `409` and must be regenerated. Successful approval returns `200` with `{ "success": true, "message": "AI draft approved successfully.", "draft": { "id", "status": "approved", "approvedText" } }`.
+
+Rejection only transitions a business-scoped `draft_ready` job to `rejected`, recording the owner, time, and optional reason. A repeated or otherwise ineligible transition returns `409`; a missing or other-business draft returns the same `404` response. Success returns `200` with `{ "success": true, "message": "AI draft rejected successfully.", "draft": { "id", "status": "rejected" } }`.
+
+Invalid IDs or bodies return `400`; missing authentication returns `401`; missing/other-business drafts return `404`; stale, already-transitioned, or otherwise conflicting states return `409`. Approval and rejection do not send a message, reserve a send, or call a provider.
+
+### Conversation response mode
+
+`GET /api/v1/conversations/:conversationId/response-mode` requires JWT authentication and reads only the mode for the conversation scoped to the business in the JWT. It returns `404` with `"Conversation not found."` for a missing or inaccessible conversation, and `400` for an invalid conversation ID. Success (`200`) returns:
+
+```json
+{
+  "success": true,
+  "conversation": {
+    "id": "conversation-id",
+    "responseMode": "human"
+  }
+}
+```
+
+This GET operation does not modify the conversation or its control version. The PATCH endpoint below remains the separate mode-changing operation.
+
+`PATCH /api/v1/conversations/:conversationId/response-mode` requires JWT authentication and accepts only `{ "responseMode": "human" }` or `{ "responseMode": "ai" }`. The conversation is scoped to the business in the JWT. Unknown body fields, invalid IDs, or unsupported modes return `400`; missing authentication returns `401`; a conversation outside the owner's scope returns `404`.
+
+Switching to `human` uses the existing atomic takeover operation and increments `aiControlVersion`. Switching to `ai` from human mode also increments the fence, so drafts approved or generated under an earlier control version cannot be used as current approvals. An active AI send reservation returns `409` with code `send_in_progress`; other state conflicts return `409`. An unchanged mode is acknowledged as `200` without changing the mode. Successful responses contain the conversation ID and resulting `responseMode`. This endpoint does not generate drafts, enqueue jobs, or send messages.
 
 ### Conversation inbox and message history
 
