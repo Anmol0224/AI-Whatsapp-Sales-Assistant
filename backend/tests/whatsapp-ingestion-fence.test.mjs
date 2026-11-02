@@ -6,6 +6,7 @@ import { Conversation } from '../dist/models/conversation.model.js'
 import { Customer } from '../dist/models/customer.model.js'
 import { Message } from '../dist/models/message.model.js'
 import { AiReplyJob } from '../dist/models/ai-reply-job.model.js'
+import { subscribeToAiDraftWorkerWake } from '../dist/services/ai-draft-worker-wake.js'
 import { ingestWhatsAppPayload } from '../dist/services/whatsapp-ingestion.service.js'
 
 const businessId = new Types.ObjectId()
@@ -61,16 +62,28 @@ async function withMongoModelMocks(run, options = {}) {
     aiReplyJobFindOne: AiReplyJob.findOne,
     aiReplyJobCreate: AiReplyJob.create,
   }
-  const state = { conversation: null, customer: null, messages: [], jobs: [], sessionsEnded: 0 }
+  const state = {
+    conversation: null,
+    customer: null,
+    messages: [],
+    jobs: [],
+    sessionsEnded: 0,
+    transactionCommitted: false,
+  }
 
   mongoose.startSession = async () => ({
     async withTransaction(callback) {
       const snapshot = structuredClone(state)
-      try { return await callback() } catch (error) {
+      try {
+        const result = await callback()
+        state.transactionCommitted = true
+        return result
+      } catch (error) {
         state.conversation = snapshot.conversation
         state.customer = snapshot.customer
         state.messages = snapshot.messages
         state.jobs = snapshot.jobs
+        state.transactionCommitted = snapshot.transactionCommitted
         throw error
       }
     },
@@ -199,6 +212,31 @@ test('AI mode plus enabled worker creates one queued job inside inbound persiste
   })
 })
 
+test('eligible job wake is emitted only after its inbound transaction commits', async () => {
+  let wakeCount = 0
+  let transactionWasCommittedAtWake = false
+  const unsubscribe = subscribeToAiDraftWorkerWake(() => {
+    wakeCount += 1
+    transactionWasCommittedAtWake = stateUnderTest.transactionCommitted
+  })
+  let stateUnderTest
+
+  try {
+    await withMongoModelMocks(async (state) => {
+      stateUnderTest = state
+      await ingestWhatsAppPayload(payload('wamid.wake-after-commit'), undefined, {
+        aiDraftWorkerEnabled: true,
+      })
+      assert.equal(state.jobs.length, 1)
+    })
+  } finally {
+    unsubscribe()
+  }
+
+  assert.equal(wakeCount, 1)
+  assert.equal(transactionWasCommittedAtWake, true)
+})
+
 test('Human mode with worker enabled persists the inbound message without a job', async () => {
   await withMongoModelMocks(async (state) => {
     await ingestWhatsAppPayload(payload('wamid.human-mode'), undefined, {
@@ -233,6 +271,9 @@ test('duplicate webhook delivery in AI mode creates exactly one message and one 
 })
 
 test('job insertion failure rolls back customer, conversation, message and fence', async () => {
+  let wakeCount = 0
+  const unsubscribe = subscribeToAiDraftWorkerWake(() => { wakeCount += 1 })
+  try {
   await withMongoModelMocks(async (state) => {
     await assert.rejects(
       ingestWhatsAppPayload(payload('wamid.job-failure'), undefined, { aiDraftWorkerEnabled: true }),
@@ -243,6 +284,10 @@ test('job insertion failure rolls back customer, conversation, message and fence
     assert.equal(state.jobs.length, 0)
     assert.equal(state.sessionsEnded, 1)
   }, { jobInsertFails: true })
+  } finally {
+    unsubscribe()
+  }
+  assert.equal(wakeCount, 0)
 })
 
 test('unsupported media events do not create inbound messages or AI jobs', async () => {

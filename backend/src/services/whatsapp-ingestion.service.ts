@@ -1,10 +1,13 @@
 import mongoose, { Types, type UpdateQuery } from "mongoose";
+import { performance } from "node:perf_hooks";
 import { z } from "zod";
 import { env } from "../config/env.js";
 import { Business } from "../models/business.model.js";
 import { Conversation, type ConversationFields } from "../models/conversation.model.js";
 import { Customer, type CustomerFields } from "../models/customer.model.js";
 import { Message, type MessageFields } from "../models/message.model.js";
+import { logAiPipelineTiming } from "./ai-pipeline-telemetry.js";
+import { wakeAiDraftWorker } from "./ai-draft-worker-wake.js";
 import { createAiReplyJobInSession } from "./ai-reply-job.repository.js";
 
 const phoneNumberSchema = z
@@ -256,10 +259,13 @@ async function persistIncomingTextMessage(
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const session = await mongoose.startSession();
     let result: "inserted" | "duplicate" | "unmapped" | undefined;
+    let aiJobCreation: Awaited<ReturnType<typeof createAiReplyJobInSession>> | undefined;
+    const transactionStartedAt = performance.now();
 
     try {
       await session.withTransaction(async () => {
         result = undefined;
+        aiJobCreation = undefined;
         const business = await Business.findOne({
           _id: businessObjectId,
           "whatsapp.phoneNumberId": incoming.phoneNumberId,
@@ -354,7 +360,7 @@ async function persistIncomingTextMessage(
         }
 
         if (aiDraftWorkerEnabled && conversation.responseMode === "ai") {
-          await createAiReplyJobInSession({
+          aiJobCreation = await createAiReplyJobInSession({
             businessId: businessObjectId,
             conversationId: conversation._id,
             inboundMessageId: createdMessage._id,
@@ -365,14 +371,60 @@ async function persistIncomingTextMessage(
         result = "inserted";
       });
 
-      if (result) return result;
+      if (result) {
+        const durationMs = performance.now() - transactionStartedAt;
+        logAiPipelineTiming({
+          event: "ai_pipeline.inbound_transaction",
+          stage: "inbound_transaction",
+          durationMs,
+          outcome: result,
+          ...(aiJobCreation?.kind === "created" ? { jobId: aiJobCreation.jobId.toString() } : {}),
+        });
+        if (aiJobCreation?.kind === "created") {
+          logAiPipelineTiming({
+            event: "ai_pipeline.job_created",
+            stage: "job_creation",
+            outcome: "queued",
+            jobId: aiJobCreation.jobId.toString(),
+            ...(aiJobCreation.createdAt ? { jobCreatedAt: aiJobCreation.createdAt } : {}),
+          });
+          // withTransaction has resolved successfully, so the committed job is now visible.
+          // The worker signal is best-effort; its five-second polling remains the fallback.
+          wakeAiDraftWorker();
+        }
+        return result;
+      }
       throw new Error("Message transaction completed without a result.");
     } catch (error) {
-      if (!isDuplicateKeyError(error)) throw error;
+      if (!isDuplicateKeyError(error)) {
+        logAiPipelineTiming({
+          event: "ai_pipeline.inbound_transaction",
+          stage: "inbound_transaction",
+          durationMs: performance.now() - transactionStartedAt,
+          outcome: "error",
+        });
+        throw error;
+      }
 
       const existing = await findStoredMessage(businessId, incoming.providerMessageId);
-      if (existing) return "duplicate";
-      if (attempt === 1) throw error;
+      if (existing) {
+        logAiPipelineTiming({
+          event: "ai_pipeline.inbound_transaction",
+          stage: "inbound_transaction",
+          durationMs: performance.now() - transactionStartedAt,
+          outcome: "duplicate",
+        });
+        return "duplicate";
+      }
+      if (attempt === 1) {
+        logAiPipelineTiming({
+          event: "ai_pipeline.inbound_transaction",
+          stage: "inbound_transaction",
+          durationMs: performance.now() - transactionStartedAt,
+          outcome: "error",
+        });
+        throw error;
+      }
     } finally {
       await session.endSession();
     }
@@ -453,45 +505,61 @@ export async function ingestWhatsAppPayload(
   repository: WhatsAppIngestionRepository = mongooseRepository,
   options: { aiDraftWorkerEnabled?: boolean } = {},
 ): Promise<IngestionResult> {
-  const parsed = parseWhatsAppPayload(payload);
-  if (parsed.kind !== "events") return parsed;
-
-  let inserted = 0;
-  let duplicates = 0;
-  let recognizedStatus = false;
-  const resolved = new Map<string, string | null>();
-
-  for (const message of parsed.messages) {
-    if (!message.phoneNumberId) continue;
-    let businessId = resolved.get(message.phoneNumberId);
-    if (businessId === undefined) {
-      businessId = await repository.resolveBusinessId(message.phoneNumberId);
-      resolved.set(message.phoneNumberId, businessId);
+  const ingestionStartedAt = performance.now();
+  let outcome: "accepted" | "ignored" | "malformed" | "error" = "error";
+  try {
+    const parsed = parseWhatsAppPayload(payload);
+    if (parsed.kind !== "events") {
+      outcome = parsed.kind;
+      return parsed;
     }
-    if (!businessId) continue;
 
-    const persistenceResult = await repository.persistIncomingTextMessage(
-      businessId,
-      message,
-      options.aiDraftWorkerEnabled ?? env.AI_DRAFT_WORKER_ENABLED,
-    );
-    if (persistenceResult === "inserted") inserted += 1;
-    else if (persistenceResult === "duplicate") duplicates += 1;
-  }
+    let inserted = 0;
+    let duplicates = 0;
+    let recognizedStatus = false;
+    const resolved = new Map<string, string | null>();
 
-  for (const status of parsed.statuses) {
-    if (!status.phoneNumberId) continue;
-    let businessId = resolved.get(status.phoneNumberId);
-    if (businessId === undefined) {
-      businessId = await repository.resolveBusinessId(status.phoneNumberId);
-      resolved.set(status.phoneNumberId, businessId);
+    for (const message of parsed.messages) {
+      if (!message.phoneNumberId) continue;
+      let businessId = resolved.get(message.phoneNumberId);
+      if (businessId === undefined) {
+        businessId = await repository.resolveBusinessId(message.phoneNumberId);
+        resolved.set(message.phoneNumberId, businessId);
+      }
+      if (!businessId) continue;
+
+      const persistenceResult = await repository.persistIncomingTextMessage(
+        businessId,
+        message,
+        options.aiDraftWorkerEnabled ?? env.AI_DRAFT_WORKER_ENABLED,
+      );
+      if (persistenceResult === "inserted") inserted += 1;
+      else if (persistenceResult === "duplicate") duplicates += 1;
     }
-    if (!businessId) continue;
-    const statusResult = await repository.updateOutgoingMessageStatus(businessId, status);
-    if (statusResult !== "unknown") recognizedStatus = true;
-  }
 
-  return inserted + duplicates > 0 || recognizedStatus
-    ? { kind: "accepted", inserted, duplicates }
-    : { kind: "ignored" };
+    for (const status of parsed.statuses) {
+      if (!status.phoneNumberId) continue;
+      let businessId = resolved.get(status.phoneNumberId);
+      if (businessId === undefined) {
+        businessId = await repository.resolveBusinessId(status.phoneNumberId);
+        resolved.set(status.phoneNumberId, businessId);
+      }
+      if (!businessId) continue;
+      const statusResult = await repository.updateOutgoingMessageStatus(businessId, status);
+      if (statusResult !== "unknown") recognizedStatus = true;
+    }
+
+    const result = inserted + duplicates > 0 || recognizedStatus
+      ? { kind: "accepted" as const, inserted, duplicates }
+      : { kind: "ignored" as const };
+    outcome = result.kind;
+    return result;
+  } finally {
+    logAiPipelineTiming({
+      event: "ai_pipeline.webhook_ingestion",
+      stage: "ingestion",
+      durationMs: performance.now() - ingestionStartedAt,
+      outcome,
+    });
+  }
 }

@@ -1,7 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { Router } from "express";
+import { performance } from "node:perf_hooks";
 import { z } from "zod";
 import { env } from "../../config/env.js";
+import { logAiPipelineTiming } from "../../services/ai-pipeline-telemetry.js";
 import {
   ingestWhatsAppPayload,
   type IngestionResult,
@@ -99,6 +101,7 @@ export function createWhatsAppWebhookRouter(ingest: PayloadIngester = ingestWhat
   });
 
   whatsappWebhookRouter.post("/", async (request, response) => {
+    const requestStartedAt = performance.now();
     if (!env.META_APP_SECRET) {
       response.status(503).json({
         success: false,
@@ -139,6 +142,21 @@ export function createWhatsAppWebhookRouter(ingest: PayloadIngester = ingestWhat
       });
       return;
     }
+
+    response.once("finish", () => {
+      const status = response.statusCode;
+      logAiPipelineTiming({
+        event: "ai_pipeline.webhook_request",
+        stage: "http_processing",
+        durationMs: performance.now() - requestStartedAt,
+        httpStatus: status,
+        outcome: status >= 200 && status < 300
+          ? "success"
+          : status >= 400 && status < 500
+            ? "validation_rejected"
+            : "retryable_failure",
+      });
+    });
 
     let payload: unknown;
     try {

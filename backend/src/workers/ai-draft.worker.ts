@@ -1,4 +1,5 @@
 import type { AiDraftWorkerOutcome } from "../services/ai-draft-processor.service.js";
+import { subscribeToAiDraftWorkerWake } from "../services/ai-draft-worker-wake.js";
 
 export interface AiDraftWorkerRuntimeOptions {
   enabled?: boolean;
@@ -26,8 +27,18 @@ export function createAiDraftWorkerRuntime(options: AiDraftWorkerRuntimeOptions)
   let stopping = false;
   let loopPromise: Promise<void> | null = null;
   let wakePendingWait: (() => void) | null = null;
+  let wakeVersion = 0;
+  let unsubscribeWake: (() => void) | null = null;
 
-  function waitForNextPoll(): Promise<void> {
+  function handleWake(): void {
+    if (stopping) return;
+    wakeVersion += 1;
+    wakePendingWait?.();
+  }
+
+  function waitForNextPoll(observedWakeVersion: number): Promise<void> {
+    if (stopping || wakeVersion !== observedWakeVersion) return Promise.resolve();
+
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
         wakePendingWait = null;
@@ -43,19 +54,30 @@ export function createAiDraftWorkerRuntime(options: AiDraftWorkerRuntimeOptions)
 
   async function run(): Promise<void> {
     while (!stopping) {
+      const observedWakeVersion = wakeVersion;
+      let outcome: AiDraftWorkerOutcome | undefined;
       try {
-        await options.processNext();
+        outcome = await options.processNext();
       } catch {
         reportError();
       }
 
-      if (!stopping) await waitForNextPoll();
+      if (stopping) break;
+
+      // A claimed job may have been completed or deferred. Immediately drain any other
+      // currently eligible jobs; claimNext still enforces nextAttemptAt and the lease fences.
+      if (outcome && outcome.kind !== "idle") continue;
+
+      // Idle polling remains the fallback for other processes and missed notifications.
+      // A wake received while this cycle was running skips the wait without overlapping it.
+      await waitForNextPoll(observedWakeVersion);
     }
   }
 
   function start(): boolean {
     if (!enabled || loopPromise) return false;
     stopping = false;
+    unsubscribeWake = subscribeToAiDraftWorkerWake(handleWake);
     loopPromise = run();
     return true;
   }
@@ -64,6 +86,8 @@ export function createAiDraftWorkerRuntime(options: AiDraftWorkerRuntimeOptions)
     const currentLoop = loopPromise;
     if (!currentLoop) return;
     stopping = true;
+    unsubscribeWake?.();
+    unsubscribeWake = null;
     wakePendingWait?.();
     await currentLoop;
     if (loopPromise === currentLoop) loopPromise = null;

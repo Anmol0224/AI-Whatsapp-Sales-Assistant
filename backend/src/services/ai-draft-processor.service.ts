@@ -1,4 +1,6 @@
 import { Types } from "mongoose";
+import { performance } from "node:perf_hooks";
+import { logAiPipelineTiming } from "./ai-pipeline-telemetry.js";
 import {
   AI_REPLY_JOB_MAX_ATTEMPTS,
   cancelProcessingAiReplyJob,
@@ -33,6 +35,8 @@ export interface ClaimedAiReplyJob {
   conversationId: Types.ObjectId | string;
   inboundMessageId: Types.ObjectId | string;
   attemptCount: number;
+  createdAt?: Date;
+  nextAttemptAt?: Date;
 }
 
 export type AiDraftWorkerOutcome =
@@ -248,6 +252,25 @@ export function createAiDraftProcessor(options: AiDraftProcessorOptions) {
   }
 
   async function processClaimed(job: ClaimedAiReplyJob): Promise<AiDraftWorkerOutcome> {
+    const processingStartedAt = performance.now();
+    let outcome: AiDraftWorkerOutcome["kind"] | "error" = "error";
+    try {
+      const result = await processClaimedJob(job);
+      outcome = result.kind;
+      return result;
+    } finally {
+      logAiPipelineTiming({
+        event: "ai_pipeline.job_processing",
+        stage: "job_processing",
+        durationMs: performance.now() - processingStartedAt,
+        outcome,
+        jobId: String(job._id),
+        attemptNumber: job.attemptCount,
+      });
+    }
+  }
+
+  async function processClaimedJob(job: ClaimedAiReplyJob): Promise<AiDraftWorkerOutcome> {
     const businessId = toObjectId(job.businessId);
     const jobId = toObjectId(job._id);
     const conversationId = toObjectId(job.conversationId);
@@ -266,16 +289,34 @@ export function createAiDraftProcessor(options: AiDraftProcessorOptions) {
     if (firstMode.mode !== "ai") return cancel(job, businessId, jobId);
 
     let contextResult: BusinessContextResult;
+    const contextStartedAt = performance.now();
     try {
       contextResult = await contextService.retrieve({ businessId, conversationId, inboundMessageId });
     } catch (error) {
       const transient = isTransientDatabaseError(error);
+      logAiPipelineTiming({
+        event: "ai_pipeline.context_retrieval",
+        stage: "business_context",
+        durationMs: performance.now() - contextStartedAt,
+        outcome: transient ? "database_unavailable" : "internal_error",
+        jobId: jobId.toString(),
+        attemptNumber: job.attemptCount,
+      });
       return failOrRetry(
         job, businessId, jobId,
         transient ? "database_unavailable" : "internal_error",
         transient,
       );
     }
+
+    logAiPipelineTiming({
+      event: "ai_pipeline.context_retrieval",
+      stage: "business_context",
+      durationMs: performance.now() - contextStartedAt,
+      outcome: contextResult.status,
+      jobId: jobId.toString(),
+      attemptNumber: job.attemptCount,
+    });
 
     if (contextResult.status !== "ready") {
       const transient = contextResult.reason === "context_unavailable";
@@ -302,26 +343,62 @@ export function createAiDraftProcessor(options: AiDraftProcessorOptions) {
     if (generationMode.mode !== "ai") return cancel(job, businessId, jobId);
 
     let generatedText: unknown;
+    const generationStartedAt = performance.now();
     try {
       generatedText = (await options.generator.generateText(promptResult.request)).text;
     } catch (error) {
       const failure = categorizeGeminiFailure(error);
+      logAiPipelineTiming({
+        event: "ai_pipeline.gemini_request",
+        stage: "gemini_generation",
+        durationMs: performance.now() - generationStartedAt,
+        outcome: failure.errorCode,
+        jobId: jobId.toString(),
+        attemptNumber: job.attemptCount,
+      });
       return failOrRetry(job, businessId, jobId, failure.errorCode, failure.retryable);
     }
+
+    logAiPipelineTiming({
+      event: "ai_pipeline.gemini_request",
+      stage: "gemini_generation",
+      durationMs: performance.now() - generationStartedAt,
+      outcome: "success",
+      jobId: jobId.toString(),
+      attemptNumber: job.attemptCount,
+    });
 
     const draft = validateDraft(generatedText);
     if (!draft) return failOrRetry(job, businessId, jobId, "invalid_output", false);
 
     // The transactional repository check is the final response-mode check and shares a Conversation write fence with takeover.
+    const persistenceStartedAt = performance.now();
     try {
       const saved = await repository.saveDraft(
         businessId, conversationId, jobId, job.attemptCount, draft,
       );
+      logAiPipelineTiming({
+        event: "ai_pipeline.draft_persistence",
+        stage: "draft_persistence",
+        durationMs: performance.now() - persistenceStartedAt,
+        outcome: saved.kind,
+        jobId: jobId.toString(),
+        attemptNumber: job.attemptCount,
+      });
       if (saved.kind === "saved") return { kind: "draft_ready" };
       if (saved.kind === "mode_changed") return cancel(job, businessId, jobId);
       return { kind: "stale" };
     } catch (error) {
-      if (isTransientDatabaseError(error)) {
+      const transient = isTransientDatabaseError(error);
+      logAiPipelineTiming({
+        event: "ai_pipeline.draft_persistence",
+        stage: "draft_persistence",
+        durationMs: performance.now() - persistenceStartedAt,
+        outcome: transient ? "database_unavailable" : "internal_error",
+        jobId: jobId.toString(),
+        attemptNumber: job.attemptCount,
+      });
+      if (transient) {
         // If the write committed despite a lost acknowledgement, the status fence prevents a second draft.
         return failOrRetry(job, businessId, jobId, "database_unavailable", true);
       }
@@ -331,8 +408,56 @@ export function createAiDraftProcessor(options: AiDraftProcessorOptions) {
 
   async function processNext(): Promise<AiDraftWorkerOutcome> {
     const timestamp = now();
-    await repository.recoverExpired(timestamp, AI_REPLY_JOB_MAX_ATTEMPTS);
-    const job = await repository.claimNext(timestamp);
+    const cycleStartedAt = performance.now();
+    const recoveryStartedAt = performance.now();
+    let recoveryDurationMs = 0;
+    try {
+      await repository.recoverExpired(timestamp, AI_REPLY_JOB_MAX_ATTEMPTS);
+      recoveryDurationMs = performance.now() - recoveryStartedAt;
+    } catch (error) {
+      logAiPipelineTiming({
+        event: "ai_pipeline.queue_cycle",
+        stage: "queue_recovery_and_claim",
+        durationMs: performance.now() - cycleStartedAt,
+        recoveryDurationMs: performance.now() - recoveryStartedAt,
+        outcome: "recovery_error",
+      });
+      throw error;
+    }
+
+    const claimStartedAt = performance.now();
+    let job: ClaimedAiReplyJob | null;
+    try {
+      job = await repository.claimNext(timestamp);
+    } catch (error) {
+      logAiPipelineTiming({
+        event: "ai_pipeline.queue_cycle",
+        stage: "queue_recovery_and_claim",
+        durationMs: performance.now() - cycleStartedAt,
+        recoveryDurationMs,
+        claimDurationMs: performance.now() - claimStartedAt,
+        outcome: "claim_error",
+      });
+      throw error;
+    }
+
+    const claimedAt = new Date();
+    const queueDueAt = job?.nextAttemptAt instanceof Date
+      ? job.nextAttemptAt
+      : job?.createdAt instanceof Date ? job.createdAt : undefined;
+    logAiPipelineTiming({
+      event: "ai_pipeline.queue_cycle",
+      stage: "queue_recovery_and_claim",
+      durationMs: performance.now() - cycleStartedAt,
+      recoveryDurationMs,
+      claimDurationMs: performance.now() - claimStartedAt,
+      outcome: job ? "claimed" : "idle",
+      ...(job ? {
+        jobId: String(job._id),
+        attemptNumber: job.attemptCount,
+        ...(queueDueAt ? { queueWaitMs: Math.max(0, claimedAt.getTime() - queueDueAt.getTime()) } : {}),
+      } : {}),
+    });
     if (!job) return { kind: "idle" };
 
     try {

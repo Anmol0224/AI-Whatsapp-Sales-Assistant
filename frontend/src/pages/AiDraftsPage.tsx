@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ApiError, approveAiDraft, getAiDraft, getAiDrafts, getConversationMessages, getConversationResponseMode, getConversations, rejectAiDraft, updateConversationResponseMode, type AiDraftSourceMessage, type AiReplyDraft, type AiReplyDraftStatus, type ConversationResponseMode, type InboxConversation, type InboxMessage } from '../services/api'
+import { ApiError, approveAiDraft, getAiDraft, getAiDrafts, getConversationMessages, getConversationResponseMode, getConversations, rejectAiDraft, sendApprovedAiDraft, updateConversationResponseMode, type AiDraftSourceMessage, type AiReplyDraft, type AiReplyDraftStatus, type ConversationResponseMode, type InboxConversation, type InboxMessage } from '../services/api'
 
 const pageSize = 20
 const conversationPageSize = 100
@@ -14,6 +14,12 @@ type DraftContext = {
   sourceMessage: AiDraftSourceMessage | null
   recentMessages: InboxMessage[]
   error?: string
+}
+
+type SendFeedback = {
+  draftId: string
+  kind: 'sent' | 'already_sent' | 'definitive_failure' | 'uncertain'
+  message: string
 }
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -121,9 +127,11 @@ export function AiDraftsPage() {
   const [detailDraft, setDetailDraft] = useState<AiReplyDraft | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
   const [editedText, setEditedText] = useState('')
-  const [action, setAction] = useState<'approve' | 'reject' | null>(null)
+  const [action, setAction] = useState<'approve' | 'reject' | 'send' | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [actionSuccess, setActionSuccess] = useState<string | null>(null)
+  const [sendFeedback, setSendFeedback] = useState<SendFeedback | null>(null)
+  const [sendLockedDrafts, setSendLockedDrafts] = useState<Record<string, true>>({})
   const [responseModes, setResponseModes] = useState<Record<string, ConversationResponseMode>>({})
   const [desiredMode, setDesiredMode] = useState<ConversationResponseMode | ''>('')
   const [modeLoading, setModeLoading] = useState(false)
@@ -132,9 +140,28 @@ export function AiDraftsPage() {
   const [modeError, setModeError] = useState<string | null>(null)
   const [modeSuccess, setModeSuccess] = useState<string | null>(null)
   const actionInProgress = useRef(false)
+  const draftListRequestInFlight = useRef(false)
+  const queuedDraftListRefresh = useRef(false)
+  const componentMounted = useRef(false)
+  const contextsRef = useRef(contexts)
+  contextsRef.current = contexts
+
+  useEffect(() => {
+    componentMounted.current = true
+    return () => { componentMounted.current = false }
+  }, [])
+
+  function finishDraftListRequest() {
+    draftListRequestInFlight.current = false
+    if (queuedDraftListRefresh.current && componentMounted.current) {
+      queuedDraftListRefresh.current = false
+      setRefreshKey((value) => value + 1)
+    }
+  }
 
   const selectedContext = selectedDraft ? contexts[selectedDraft.id] : undefined
   const selectedStatus = detailDraft?.status ?? selectedDraft?.status
+  const selectedSendFeedback = selectedDraft && sendFeedback?.draftId === selectedDraft.id ? sendFeedback : null
   const currentMode = selectedDraft ? responseModes[selectedDraft.conversationId] : undefined
   const editorIsEditable = selectedStatus === 'draft_ready'
   const approvedSourceText = detailDraft?.generatedDraft ?? selectedDraft?.generatedDraft ?? ''
@@ -155,6 +182,12 @@ export function AiDraftsPage() {
 
   useEffect(() => {
     let current = true
+    if (draftListRequestInFlight.current) {
+      queuedDraftListRefresh.current = true
+      return () => { current = false }
+    }
+
+    draftListRequestInFlight.current = true
     setListLoading(true)
     setListError(null)
 
@@ -196,10 +229,113 @@ export function AiDraftsPage() {
       })
       .finally(() => {
         if (current) setListLoading(false)
+        finishDraftListRequest()
       })
 
     return () => { current = false }
   }, [page, refreshKey, status])
+
+  useEffect(() => {
+    let active = true
+    let intervalId: number | undefined
+
+    async function refreshDraftListInBackground() {
+      if (!active || document.visibilityState === 'hidden' || draftListRequestInFlight.current) return
+      draftListRequestInFlight.current = true
+
+      try {
+        const [list, pending] = await Promise.all([
+          getAiDrafts({ page, limit: pageSize, status }),
+          status === 'draft_ready'
+            ? Promise.resolve(null)
+            : getAiDrafts({ page: 1, limit: 1, status: 'draft_ready' }),
+        ])
+        if (!active) return
+
+        const missingContexts = list.drafts.filter((draft) => !contextsRef.current[draft.id])
+        let newContexts: Record<string, DraftContext> = {}
+        if (missingContexts.length > 0) {
+          let summaries = new Map<string, InboxConversation>()
+          try {
+            summaries = await loadConversationSummaries(
+              [...new Set(missingContexts.map((draft) => draft.conversationId))],
+            )
+          } catch {
+            // Existing draft information remains usable if summaries are temporarily unavailable.
+          }
+          const pairs = await mapWithConcurrency(missingContexts, 4, async (draft) => [
+            draft.id,
+            await loadContextForDraft(draft, summaries),
+          ] as const)
+          newContexts = Object.fromEntries(pairs)
+        }
+        if (!active) return
+
+        setDrafts(list.drafts)
+        setPagination(list.pagination)
+        setPendingCount(status === 'draft_ready' ? list.pagination.totalItems : pending?.pagination.totalItems ?? 0)
+        if (Object.keys(newContexts).length > 0) {
+          setContexts((current) => ({ ...current, ...newContexts }))
+        }
+        setSelectedDraft((existing) => {
+          if (!existing) return list.drafts[0] ?? null
+          return list.drafts.find((draft) => draft.id === existing.id) ?? existing
+        })
+        setDetailDraft((existing) => {
+          if (!existing) return existing
+          const refreshed = list.drafts.find((draft) => draft.id === existing.id)
+          return refreshed
+            ? {
+                ...existing,
+                status: refreshed.status,
+                approvedText: refreshed.approvedText,
+                approvalEdited: refreshed.approvalEdited,
+                updatedAt: refreshed.updatedAt,
+              }
+            : existing
+        })
+        setListError(null)
+      } catch (error) {
+        if (active) setListError(errorMessage(error, 'AI drafts could not be refreshed. Please retry.'))
+      } finally {
+        finishDraftListRequest()
+      }
+    }
+
+    function stopPolling() {
+      if (intervalId !== undefined) {
+        window.clearInterval(intervalId)
+        intervalId = undefined
+      }
+    }
+
+    function startPolling() {
+      stopPolling()
+      if (active && document.visibilityState !== 'hidden') {
+        intervalId = window.setInterval(() => {
+          void refreshDraftListInBackground()
+        }, 5_000)
+      }
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === 'hidden') {
+        stopPolling()
+      } else {
+        void refreshDraftListInBackground()
+        startPolling()
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    startPolling()
+
+    return () => {
+      active = false
+      stopPolling()
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [page, status])
 
   useEffect(() => {
     setDesiredMode(selectedDraft ? responseModes[selectedDraft.conversationId] ?? '' : '')
@@ -329,6 +465,62 @@ export function AiDraftsPage() {
     }
   }
 
+  async function handleSendApproved() {
+    if (!selectedDraft || selectedStatus !== 'approved' || actionInProgress.current || sendLockedDrafts[selectedDraft.id]) return
+    const confirmed = window.confirm(
+      `Send the approved response to ${selectedCustomerLabel} through WhatsApp? This sends the approved text as-is. It cannot be edited in this action.`,
+    )
+    if (!confirmed) return
+
+    actionInProgress.current = true
+    setAction('send')
+    setActionError(null)
+    setActionSuccess(null)
+    setSendFeedback(null)
+    try {
+      const result = await sendApprovedAiDraft(selectedDraft.id)
+      const kind = result.draft.status === 'outcome_uncertain'
+        ? 'uncertain'
+        : result.draft.alreadySent === true
+          ? 'already_sent'
+          : 'sent'
+      const message = kind === 'sent'
+        ? 'Sent successfully through WhatsApp.'
+        : kind === 'already_sent'
+          ? 'This approved reply was already sent. No additional message was sent.'
+          : 'The send outcome is uncertain. Check the WhatsApp conversation before doing anything else. Do not retry this send.'
+      const nextStatus: AiReplyDraftStatus = kind === 'uncertain' ? 'send_uncertain' : 'sent'
+      const updatedDraft = { ...(detailDraft ?? selectedDraft), status: nextStatus }
+      setDetailDraft(updatedDraft)
+      setSelectedDraft(updatedDraft)
+      setSendFeedback({ draftId: selectedDraft.id, kind, message })
+      if (kind === 'uncertain') setSendLockedDrafts((current) => ({ ...current, [selectedDraft.id]: true }))
+      setRefreshKey((value) => value + 1)
+    } catch (error) {
+      const isDefinitiveRejection = error instanceof ApiError &&
+        error.status === 502 && error.message === 'WhatsApp did not accept the approved message.'
+      const isPotentiallyAmbiguous = !(error instanceof ApiError) || error.status === undefined || error.status >= 500
+      if (isDefinitiveRejection) {
+        const failedDraft = { ...(detailDraft ?? selectedDraft), status: 'send_failed' as const }
+        setDetailDraft(failedDraft)
+        setSelectedDraft(failedDraft)
+        setSendFeedback({ draftId: selectedDraft.id, kind: 'definitive_failure', message: 'WhatsApp definitively rejected this message. It was not recorded as sent.' })
+        setRefreshKey((value) => value + 1)
+      } else if (isPotentiallyAmbiguous) {
+        const uncertainDraft = { ...(detailDraft ?? selectedDraft), status: 'send_uncertain' as const }
+        setDetailDraft(uncertainDraft)
+        setSelectedDraft(uncertainDraft)
+        setSendLockedDrafts((current) => ({ ...current, [selectedDraft.id]: true }))
+        setSendFeedback({ draftId: selectedDraft.id, kind: 'uncertain', message: 'The send outcome could not be confirmed. Check the WhatsApp conversation before doing anything else. Do not retry this send.' })
+      } else {
+        setActionError(errorMessage(error, 'The approved reply could not be sent. The approved draft remains unchanged.'))
+      }
+    } finally {
+      actionInProgress.current = false
+      setAction(null)
+    }
+  }
+
   async function handleSetMode() {
     if (!selectedDraft || !desiredMode || modeSaving) return
     const prompt = desiredMode === 'ai'
@@ -406,13 +598,21 @@ export function AiDraftsPage() {
             </div>
           </div>
 
-          {listError ? (
+          {listError && drafts.length > 0 && (
+            <div className="border-b border-rose-100 bg-rose-50 p-4" role="alert">
+              <p className="text-sm font-semibold text-rose-700">Drafts could not be refreshed</p>
+              <p className="mt-1 text-sm leading-6 text-rose-800">{listError} Previously loaded drafts are still shown.</p>
+              <button type="button" onClick={() => setRefreshKey((value) => value + 1)} className="mt-3 rounded-lg border border-rose-200 bg-white px-3 py-2 text-xs font-semibold text-rose-800 outline-none hover:bg-rose-100 focus-visible:ring-2 focus-visible:ring-rose-600">Retry</button>
+            </div>
+          )}
+
+          {listError && drafts.length === 0 ? (
             <div className="p-6" role="alert">
               <p className="text-sm font-semibold text-rose-700">Drafts could not be loaded</p>
               <p className="mt-2 text-sm leading-6 text-slate-600">{listError}</p>
               <button type="button" onClick={() => setRefreshKey((value) => value + 1)} className="mt-4 rounded-lg bg-emerald-700 px-4 py-2.5 text-sm font-semibold text-white outline-none hover:bg-emerald-800 focus-visible:ring-2 focus-visible:ring-emerald-600 focus-visible:ring-offset-2">Retry</button>
             </div>
-          ) : listLoading ? (
+          ) : listLoading && drafts.length === 0 ? (
             <div className="flex min-h-56 items-center justify-center p-6" role="status" aria-live="polite">
               <span className="mr-3 h-5 w-5 animate-spin rounded-full border-2 border-slate-200 border-t-emerald-700" />
               <span className="text-sm text-slate-600">Loading drafts and conversation context…</span>
@@ -528,10 +728,23 @@ export function AiDraftsPage() {
                 {actionError && <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm leading-6 text-rose-800">{actionError}</div>}
                 {actionSuccess && <div role="status" className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm leading-6 text-emerald-800">{actionSuccess}</div>}
 
+                {selectedSendFeedback && (
+                  <div role={selectedSendFeedback.kind === 'uncertain' ? 'alert' : 'status'} className={`rounded-xl border px-4 py-3 text-sm leading-6 ${selectedSendFeedback.kind === 'uncertain' ? 'border-orange-300 bg-orange-50 font-semibold text-orange-950' : selectedSendFeedback.kind === 'definitive_failure' ? 'border-rose-200 bg-rose-50 text-rose-800' : 'border-emerald-200 bg-emerald-50 text-emerald-800'}`}>
+                    {selectedSendFeedback.message}
+                  </div>
+                )}
+
                 {editorIsEditable && (
                   <div className="flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
                     <button type="button" onClick={() => void handleReject()} disabled={action !== null || detailLoading} className="rounded-xl border border-rose-200 px-4 py-3 text-sm font-semibold text-rose-700 outline-none hover:bg-rose-50 focus-visible:ring-2 focus-visible:ring-rose-500 disabled:cursor-not-allowed disabled:opacity-50">{action === 'reject' ? 'Rejecting…' : 'Reject draft'}</button>
                     <button type="button" onClick={() => void handleApprove()} disabled={action !== null || detailLoading || !editedText.trim() || !selectedContext?.sourceMessage} className="rounded-xl bg-emerald-700 px-5 py-3 text-sm font-semibold text-white outline-none hover:bg-emerald-800 focus-visible:ring-2 focus-visible:ring-emerald-600 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50">{action === 'approve' ? 'Approving…' : 'Approve edited response'}</button>
+                  </div>
+                )}
+
+                {selectedStatus === 'approved' && !sendLockedDrafts[selectedDraft.id] && (
+                  <div className="flex flex-col gap-3 rounded-xl border border-emerald-200 bg-emerald-50/70 p-4 sm:flex-row sm:items-center sm:justify-between">
+                    <p className="text-sm leading-6 text-emerald-950">Sending will deliver the approved text to this customer through WhatsApp.</p>
+                    <button type="button" onClick={() => void handleSendApproved()} disabled={action !== null || detailLoading} className="shrink-0 rounded-xl bg-emerald-700 px-5 py-3 text-sm font-semibold text-white outline-none hover:bg-emerald-800 focus-visible:ring-2 focus-visible:ring-emerald-600 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50">{action === 'send' ? 'Sending…' : 'Send approved reply'}</button>
                   </div>
                 )}
               </div>

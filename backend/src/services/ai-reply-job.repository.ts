@@ -223,7 +223,11 @@ export async function createOrGetAiReplyJob(
 /** Creates or confirms an eligible inbound job inside the caller's message-persistence transaction. */
 export async function createAiReplyJobInSession(
   input: CreateAiReplyJobInSessionInput,
-): Promise<"created" | "exists"> {
+): Promise<{
+  kind: "created" | "exists";
+  jobId: Types.ObjectId;
+  createdAt?: Date;
+}> {
   const conversation = await Conversation.findOne({
     _id: input.conversationId,
     businessId: input.businessId,
@@ -253,26 +257,35 @@ export async function createAiReplyJobInSession(
     businessId: input.businessId,
     inboundMessageId: input.inboundMessageId,
   })
-    .select({ _id: 1, conversationId: 1 })
+    .select({ _id: 1, conversationId: 1, createdAt: 1 })
     .session(input.session)
-    .lean<{ conversationId: Types.ObjectId }>()
+    .lean<{ _id: Types.ObjectId; conversationId: Types.ObjectId; createdAt?: Date }>()
     .exec();
 
   if (existingJob) {
     if (!existingJob.conversationId.equals(input.conversationId)) {
       throw new Error("AI_REPLY_JOB_REFERENCE_CONFLICT");
     }
-    return "exists";
+    return {
+      kind: "exists",
+      jobId: existingJob._id,
+      ...(existingJob.createdAt instanceof Date ? { createdAt: existingJob.createdAt } : {}),
+    };
   }
 
-  await AiReplyJob.create([{
+  const [createdJob] = await AiReplyJob.create([{
     businessId: input.businessId,
     conversationId: input.conversationId,
     inboundMessageId: input.inboundMessageId,
     status: "queued",
   }], { session: input.session });
 
-  return "created";
+  if (!createdJob) throw new Error("AI_REPLY_JOB_CREATION_FAILED");
+  return {
+    kind: "created",
+    jobId: createdJob._id,
+    ...(createdJob.createdAt instanceof Date ? { createdAt: createdJob.createdAt } : {}),
+  };
 }
 
 /** Atomically claims one due job for this business. attemptCount acts as a fencing token for completion. */
