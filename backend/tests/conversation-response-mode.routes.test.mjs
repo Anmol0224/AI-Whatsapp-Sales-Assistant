@@ -95,6 +95,17 @@ test('response-mode GET hides inaccessible conversations', async () => {
   }, async () => null)
 })
 
+test('response-mode GET returns the Human default for legacy conversations without a stored mode', async () => {
+  await withServer(() => { throw new Error('GET must not change mode') }, async (baseUrl) => {
+    const result = await get(baseUrl, `/conversations/${conversationId}/response-mode`)
+    assert.equal(result.response.status, 200)
+    assert.deepEqual(result.body, {
+      success: true,
+      conversation: { id: conversationId.toString(), responseMode: 'human' },
+    })
+  }, async () => ({}))
+})
+
 test('response-mode endpoint validates owner request and scopes conversation by JWT business', async () => {
   await withServer((mode) => ({ kind: 'updated', responseMode: mode }), async (baseUrl, calls) => {
     const human = await patch(baseUrl, `/conversations/${conversationId}/response-mode`, { responseMode: 'human' })

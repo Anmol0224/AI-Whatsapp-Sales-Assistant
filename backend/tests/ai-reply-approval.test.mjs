@@ -29,6 +29,8 @@ function matches(document, filter) {
   for (const [key, expected] of Object.entries(filter)) {
     if (key === '$or') {
       if (!expected.some((condition) => matches(document, condition))) return false
+    } else if (key === '$and') {
+      if (!expected.every((condition) => matches(document, condition))) return false
     } else if (expected && typeof expected === 'object' && !(expected instanceof Types.ObjectId) && !(expected instanceof Date)) {
       if ('$exists' in expected) {
         if ((document[key] !== undefined) !== expected.$exists) return false

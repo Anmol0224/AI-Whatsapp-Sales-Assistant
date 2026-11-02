@@ -93,7 +93,7 @@ export interface ConversationsRouteDependencies {
   getResponseMode(
     conversationId: Types.ObjectId,
     businessId: Types.ObjectId,
-  ): Promise<{ responseMode: "human" | "ai" } | null>;
+  ): Promise<{ responseMode?: "human" | "ai" } | null>;
   changeResponseMode(
     businessId: Types.ObjectId,
     conversationId: Types.ObjectId,
@@ -210,7 +210,7 @@ const mongooseDependencies: ConversationsRouteDependencies = {
   getResponseMode: async (conversationId, businessId) =>
     Conversation.findOne({ _id: conversationId, businessId })
       .select({ _id: 1, responseMode: 1 })
-      .lean<{ responseMode: "human" | "ai" }>()
+      .lean<{ responseMode?: "human" | "ai" }>()
       .exec(),
   changeResponseMode: setConversationResponseMode,
 };
@@ -320,7 +320,7 @@ export function createConversationsRouter(
 
       response.status(200).json({
         success: true,
-        conversation: { id: parsedId.data, responseMode: conversation.responseMode },
+        conversation: { id: parsedId.data, responseMode: conversation.responseMode ?? "human" },
       });
     } catch (error) {
       next(error);

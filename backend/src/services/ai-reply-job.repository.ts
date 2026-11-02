@@ -594,7 +594,9 @@ const mongooseDraftTransitions = createAiReplyDraftTransitions({
       .exec();
     if (!current) return { kind: "not_found" };
     if (current.activeAiSendJobId) return { kind: "send_in_progress" };
-    return current.responseMode === "human" ? { kind: "already_human" } : { kind: "conflict" };
+    return current.responseMode === "human" || current.responseMode === undefined
+      ? { kind: "already_human" }
+      : { kind: "conflict" };
   },
   now: () => new Date(),
 });
@@ -642,8 +644,10 @@ export async function setConversationResponseMode(
     {
       _id: conversationId,
       businessId,
-      responseMode: "human",
-      ...hasNoActiveSendMarker(),
+      $and: [
+        { $or: [{ responseMode: "human" }, { responseMode: { $exists: false } }] },
+        hasNoActiveSendMarker(),
+      ],
     },
     {
       $set: { responseMode: "ai" },
