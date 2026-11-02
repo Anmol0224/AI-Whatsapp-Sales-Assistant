@@ -2,8 +2,11 @@ import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 
 import {
   ApiError,
   getConversationMessages,
+  getConversationResponseMode,
   getConversations,
   sendConversationMessage,
+  updateConversationResponseMode,
+  type ConversationResponseMode,
   type InboxConversation,
   type InboxMessage,
   type ConversationListResponse,
@@ -182,6 +185,13 @@ export function InboxPage() {
   const [conversationsLoading, setConversationsLoading] = useState(true)
   const [conversationsError, setConversationsError] = useState<string | null>(null)
   const [selectedConversation, setSelectedConversation] = useState<InboxConversation | null>(null)
+  const [responseMode, setResponseMode] = useState<ConversationResponseMode | null>(null)
+  const [responseModeLoading, setResponseModeLoading] = useState(false)
+  const [responseModeSaving, setResponseModeSaving] = useState(false)
+  const [responseModeError, setResponseModeError] = useState<string | null>(null)
+  const [responseModeSuccess, setResponseModeSuccess] = useState<string | null>(null)
+  const [responseModeRetry, setResponseModeRetry] = useState(0)
+  const responseModeSavingRef = useRef(false)
 
   const [messages, setMessages] = useState<InboxMessage[]>([])
   const [historyPage, setHistoryPage] = useState(1)
@@ -197,6 +207,35 @@ export function InboxPage() {
   const [scrollToNewest, setScrollToNewest] = useState(false)
   const sendingRef = useRef(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const conversationId = selectedConversation?.id
+    if (!conversationId) {
+      setResponseMode(null)
+      setResponseModeError(null)
+      setResponseModeSuccess(null)
+      return
+    }
+
+    let current = true
+    setResponseMode(null)
+    setResponseModeLoading(true)
+    setResponseModeError(null)
+    setResponseModeSuccess(null)
+
+    void getConversationResponseMode(conversationId)
+      .then((result) => {
+        if (current) setResponseMode(result.conversation.responseMode)
+      })
+      .catch((error: unknown) => {
+        if (current) setResponseModeError(getErrorMessage(error, 'Unable to load this conversation’s response mode.'))
+      })
+      .finally(() => {
+        if (current) setResponseModeLoading(false)
+      })
+
+    return () => { current = false }
+  }, [selectedConversation?.id, responseModeRetry])
 
   useEffect(() => {
     let current = true
@@ -262,7 +301,7 @@ export function InboxPage() {
   }, [messages, scrollToNewest])
 
   function selectConversation(conversation: InboxConversation) {
-    if (sendingRef.current || conversation.id === selectedConversation?.id) return
+    if (sendingRef.current || responseModeSaving || conversation.id === selectedConversation?.id) return
     setSelectedConversation(conversation)
     setMessages([])
     setHistoryResponse(null)
@@ -272,6 +311,43 @@ export function InboxPage() {
     setComposerText('')
     setSendError(null)
     setSendOutcomeUncertain(false)
+  }
+
+  async function changeResponseMode(nextMode: ConversationResponseMode) {
+    const conversation = selectedConversation
+    if (!conversation || !responseMode || responseMode === nextMode || responseModeSavingRef.current) return
+    const confirmation = nextMode === 'ai'
+      ? 'Switch this conversation to AI mode? AI may generate owner-reviewed drafts, but it will not send messages automatically.'
+      : 'Switch this conversation to Human mode? New AI draft generation will be paused.'
+    if (!window.confirm(confirmation)) return
+
+    responseModeSavingRef.current = true
+    setResponseModeSaving(true)
+    setResponseModeError(null)
+    setResponseModeSuccess(null)
+    try {
+      const result = await updateConversationResponseMode(conversation.id, nextMode)
+      if (result.conversation.id !== conversation.id) {
+        throw new ApiError('The backend returned an unexpected conversation response.', 200)
+      }
+      setResponseMode(result.conversation.responseMode)
+      setResponseModeSuccess(result.message)
+    } catch (error) {
+      setResponseModeError(getErrorMessage(error, 'Unable to update this conversation’s response mode.'))
+      setResponseMode(null)
+      setResponseModeLoading(true)
+      try {
+        const current = await getConversationResponseMode(conversation.id)
+        if (current.conversation.id === conversation.id) setResponseMode(current.conversation.responseMode)
+      } catch {
+        // Keep mode unavailable until the owner refreshes it successfully.
+      } finally {
+        setResponseModeLoading(false)
+      }
+    } finally {
+      responseModeSavingRef.current = false
+      setResponseModeSaving(false)
+    }
   }
 
   async function sendMessage(event?: FormEvent<HTMLFormElement>) {
@@ -404,7 +480,7 @@ export function InboxPage() {
                     key={conversation.id}
                     conversation={conversation}
                     selected={selectedConversation?.id === conversation.id}
-                    disabled={sending}
+                    disabled={sending || responseModeSaving}
                     onSelect={() => selectConversation(conversation)}
                   />
                 ))}
@@ -430,7 +506,7 @@ export function InboxPage() {
           ) : (
             <>
               <div className="flex items-center gap-3 border-b border-slate-100 px-4 py-4 sm:px-5">
-                <button type="button" disabled={sending} onClick={() => setSelectedConversation(null)} className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700 outline-none hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-emerald-600 disabled:cursor-not-allowed disabled:opacity-50 md:hidden">Back</button>
+                <button type="button" disabled={sending || responseModeSaving} onClick={() => setSelectedConversation(null)} className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700 outline-none hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-emerald-600 disabled:cursor-not-allowed disabled:opacity-50 md:hidden">Back</button>
                 <div className="min-w-0 flex-1">
                   <h3 className="truncate font-semibold text-slate-950">{customerHeading(selectedConversation)}</h3>
                   {selectedConversation.customer?.phoneNumber && selectedConversation.customer.profileName && (
@@ -456,6 +532,51 @@ export function InboxPage() {
                   {historyLoading ? 'Refreshing…' : 'Refresh'}
                 </button>
               </div>
+
+              <section className="border-b border-slate-100 bg-slate-50/70 px-4 py-3 sm:px-5" aria-label="Conversation response mode">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-semibold text-slate-800">Response mode</p>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {responseModeLoading
+                        ? 'Loading current mode…'
+                        : responseMode
+                          ? `Currently ${responseMode === 'ai' ? 'AI draft mode' : 'Human mode'}.`
+                          : 'Current mode is unavailable.'}
+                    </p>
+                  </div>
+                  <div className="inline-flex rounded-xl border border-slate-200 bg-white p-1" role="group" aria-label="Set conversation response mode">
+                    <button
+                      type="button"
+                      aria-pressed={responseMode === 'human'}
+                      disabled={responseModeLoading || responseModeSaving || responseMode === null || responseMode === 'human'}
+                      onClick={() => void changeResponseMode('human')}
+                      className={`rounded-lg px-3 py-2 text-xs font-semibold outline-none focus-visible:ring-2 focus-visible:ring-emerald-600 disabled:cursor-not-allowed ${responseMode === 'human' ? 'bg-slate-800 text-white' : 'text-slate-700 hover:bg-slate-100 disabled:opacity-50'}`}
+                    >
+                      {responseModeSaving && responseMode === 'ai' ? 'Switching…' : 'Human'}
+                    </button>
+                    <button
+                      type="button"
+                      aria-pressed={responseMode === 'ai'}
+                      disabled={responseModeLoading || responseModeSaving || responseMode === null || responseMode === 'ai'}
+                      onClick={() => void changeResponseMode('ai')}
+                      className={`rounded-lg px-3 py-2 text-xs font-semibold outline-none focus-visible:ring-2 focus-visible:ring-emerald-600 disabled:cursor-not-allowed ${responseMode === 'ai' ? 'bg-emerald-700 text-white' : 'text-slate-700 hover:bg-slate-100 disabled:opacity-50'}`}
+                    >
+                      {responseModeSaving && responseMode === 'human' ? 'Switching…' : 'AI'}
+                    </button>
+                  </div>
+                </div>
+                <p className="mt-2 text-[11px] leading-5 text-slate-500">AI mode can generate owner-reviewed drafts; it does not send messages automatically.</p>
+                {responseModeLoading && <p role="status" className="sr-only">Loading conversation response mode.</p>}
+                {responseModeError && (
+                  <div className="mt-2 flex flex-wrap items-center justify-between gap-2" role="alert">
+                    <p className="text-xs text-rose-700">{responseModeError}</p>
+                    <button type="button" onClick={() => setResponseModeRetry((value) => value + 1)} disabled={responseModeLoading || responseModeSaving} className="rounded-lg border border-rose-200 bg-white px-3 py-1.5 text-xs font-semibold text-rose-800 outline-none hover:bg-rose-50 focus-visible:ring-2 focus-visible:ring-rose-600 disabled:opacity-50">Refresh mode</button>
+                  </div>
+                )}
+                {responseModeSaving && <p role="status" className="mt-2 text-xs text-slate-600">Updating response mode…</p>}
+                {responseModeSuccess && <p role="status" className="mt-2 text-xs text-emerald-800">{responseModeSuccess}</p>}
+              </section>
 
               {historyError && <div className="border-b border-rose-100 p-3"><ErrorPanel compact message={historyError} onRetry={() => setHistoryRetry((value) => value + 1)} /></div>}
 

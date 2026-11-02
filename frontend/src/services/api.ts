@@ -282,6 +282,19 @@ export type AiDraftRejectionResponse = {
   draft: { id: string; status: 'rejected' }
 }
 
+export type AiDraftSendResponse =
+  | {
+      success: true
+      message: string
+      draft: { id: string; status: 'sent'; alreadySent?: true }
+      data?: { message: { id: string; text: string; status: 'sent'; createdAt: string } }
+    }
+  | {
+      success: true
+      message: string
+      draft: { id: string; status: 'outcome_uncertain' }
+    }
+
 export type AiDraftFilters = {
   page?: number
   limit?: number
@@ -683,6 +696,26 @@ function isAiDraftRejectionResponse(value: unknown): value is AiDraftRejectionRe
   )
 }
 
+function isAiDraftSendResponse(value: unknown): value is AiDraftSendResponse {
+  if (!isRecord(value) || value.success !== true || typeof value.message !== 'string' || !isRecord(value.draft)) {
+    return false
+  }
+
+  if (typeof value.draft.id !== 'string') return false
+  if (value.draft.status === 'outcome_uncertain') return true
+  if (value.draft.status !== 'sent') return false
+  if (value.draft.alreadySent === true) return true
+
+  return (
+    isRecord(value.data) &&
+    isRecord(value.data.message) &&
+    typeof value.data.message.id === 'string' &&
+    typeof value.data.message.text === 'string' &&
+    value.data.message.status === 'sent' &&
+    isDateString(value.data.message.createdAt)
+  )
+}
+
 function isConversationResponseModeResponse(value: unknown): value is ConversationResponseModeResponse {
   return (
     isRecord(value) &&
@@ -1001,6 +1034,15 @@ export function rejectAiDraft(
     `/ai-drafts/${encodeURIComponent(id)}/reject`,
     isAiDraftRejectionResponse,
     { method: 'POST', body: JSON.stringify(reason === undefined ? {} : { reason }) },
+    true,
+  )
+}
+
+export function sendApprovedAiDraft(id: string): Promise<AiDraftSendResponse> {
+  return requestJson(
+    `/ai-drafts/${encodeURIComponent(id)}/send`,
+    isAiDraftSendResponse,
+    { method: 'POST', body: JSON.stringify({}) },
     true,
   )
 }
