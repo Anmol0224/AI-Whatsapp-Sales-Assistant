@@ -1,28 +1,57 @@
-# AI Draft Worker (Phase 6.5)
+# AI Draft Worker and Queue
 
 ## Current behavior
 
-The backend has an optional, MongoDB-backed polling worker for persisted `AiReplyJob` records. It is disabled by default. It does not enqueue jobs from WhatsApp webhooks, send WhatsApp messages, create outbound message records, or expose a draft approval API.
+The backend has a MongoDB-backed AI reply job collection and an optional polling worker. Inbound WhatsApp text ingestion creates a job in the same transaction as the newly persisted inbound Message and Conversation aiControlVersion update only when both conditions hold:
 
-When enabled, the worker claims one due job at a time, checks that the conversation belongs to the job's business and remains in `ai` response mode, retrieves bounded business context, builds the controlled prompt, calls the configured Gemini adapter, validates the output, and stores it in the job's `generatedDraft` field with status `draft_ready`. That status means the draft is awaiting owner review; it does not authorize sending.
+1. AI_DRAFT_WORKER_ENABLED is true.
+2. The resolved Conversation is in AI response mode.
 
-Enablement requires both `AI_DRAFT_WORKER_ENABLED=true` and a configured backend-only `GEMINI_API_KEY`. If the worker flag is false or credentials are absent, the ordinary API continues to start and the worker does not run. `AI_DRAFT_WORKER_POLL_INTERVAL_MS` defaults to 5000 ms and accepts 250–60000 ms.
+The unique businessId + inboundMessageId index prevents duplicate jobs. A duplicate webhook delivery is acknowledged without another Message/job or another control-version increment. With AI_DRAFT_WORKER_ENABLED false, normal inbound message persistence continues and no AI job is created.
 
-## Retry and lease policy
+The worker flag defaults to false in backend source and gates both enqueueing and worker startup. This source default does not establish the setting currently configured in Render. Keep the production setting disabled as required. Worker startup additionally requires GEMINI_API_KEY; if the global flag is true but that key is absent, the API stays available and the worker does not start, while eligible webhooks can still create queued jobs. Configure both only in a controlled non-production test.
 
-- At most three generation attempts are claimed for a job.
-- Gemini timeouts, rate limits, provider errors, and transient database failures are retryable.
-- Retry delays are exponential: 1 second after attempt one, then 2 seconds after attempt two, capped at 30 seconds.
-- Missing credentials, authentication/permission failures, missing business facts or invalid references, invalid prompts, and invalid/empty/oversized model output are terminal for that job and are not retried. Transient database/context retrieval failures are retried.
-- Processing leases last 60 seconds. Expired leases are requeued while attempts remain; expired jobs that exhausted all three attempts become failed.
-- The global claim is atomic. Retry, cancellation, failure, and draft completion are fenced by business, status, attempt count, and a live lease. A stale attempt cannot overwrite a newer attempt's result.
+## Worker lifecycle
 
-## Human takeover and provider limitation
+When enabled and configured, the worker runs after the database-backed server starts. It polls using AI_DRAFT_WORKER_POLL_INTERVAL_MS, default 5000 milliseconds with an accepted range of 250–60000 milliseconds. The worker recovers eligible expired generation leases, claims due work atomically, and processes one job per iteration. Shutdown stops new polling and waits for the current cycle.
 
-The worker checks response mode before context retrieval and again before starting Gemini. Draft persistence then runs in a MongoDB transaction that conditionally increments `aiControlVersion` on the business-scoped conversation while it is still in `ai` mode, followed by the fenced job transition. Human takeover conditionally changes that same conversation to `human` and increments the same version. These writes serialize: if draft persistence wins, the draft remains for review; if takeover wins, the transaction cannot save a new draft and the current job attempt is cancelled. Transaction callbacks contain only database operations, so MongoDB may retry them without repeating Gemini generation.
+The processor validates business/conversation/message ownership and response mode, retrieves bounded context, builds the prompt, invokes the Gemini adapter outside transaction callbacks, validates output, and stores a draft. Context retrieval is business-scoped and caps context at 30 active catalog items, 20 FAQs, 12 recent messages, and 16,384 serialized bytes. The prompt builder caps the prompt at 30,000 bytes, frames customer/catalog/FAQ text as untrusted reference data, and instructs the model not to invent unsupported prices, stock, policies, availability, or promises. Business aiSettings and communicationPreferences fields are not currently applied to retrieval or prompt construction. The worker never calls WhatsApp, creates outbound Message records, or sends generated content.
 
-The Gemini adapter currently does not expose request cancellation. A provider request already in flight at takeover may continue until it completes or times out, but the result is not persisted when takeover wins the conversation fence. This corrective change uses the existing Mongoose `session.withTransaction()` convention and has mocked transaction tests; live Atlas transaction behavior/topology has not been verified here.
+## Generation limits and retry behavior
 
-## Activation boundary
+- Maximum generated text: 4096 characters.
+- Maximum claimed generation attempts: three.
+- Retry delay grows exponentially from a one-second base and is capped at 30 seconds.
+- Generation lease duration: 60 seconds.
+- Claim and terminal/retry transitions are fenced by business, status, attempt count, and lease state.
+- Provider timeouts/rate limits/transient provider failures and transient persistence/context failures may retry within the attempt limit.
+- Missing credentials, authentication/permission failures, invalid requests, invalid/empty/oversized output, and other non-retryable categories fail safely.
+- The Gemini adapter exposes only safe error categories and strictly allowlisted optional diagnostics; it does not expose arbitrary provider messages or payloads.
 
-The existing repository can create or retrieve one job per persisted inbound message, but incoming webhooks do not call it. Until a later approved step adds a guarded enqueue path, this worker processes only jobs already persisted through that repository or prepared for isolated testing. Any future enqueue path must require explicit AI eligibility and an AI-mode conversation. Owner approval and a separate approved sending action remain required before a draft can be sent.
+The backend reads the optional GEMINI_API_KEY and GEMINI_MODEL settings. The current model default is gemini-3.8-flash, but its availability has not been established by a successful generation. The adapter currently bounds a request to 32,000 input bytes, uses a 15-second timeout and a 1,024-token output ceiling, and rejects generated text over 4,096 characters. Safe diagnostics expose only allowlisted categories/statuses/network codes.
+
+The latest controlled real Gemini attempt reported HTTP 504 (provider_5xx). It was retry-scheduled, generated no persisted draft, and made no WhatsApp call. Mocked adapter/processor tests do not establish real Gemini availability.
+
+## Draft persistence and Human takeover
+
+Draft persistence runs in a MongoDB transaction. It conditionally updates the same business-scoped Conversation document only while responseMode remains ai, advances aiControlVersion, and transitions the matching live job attempt to draft_ready in that transaction. Human takeover and response-mode changes write the same Conversation fence. Inbound messages also advance this fence and invalidate older work. If takeover or a newer inbound write wins, stale draft persistence or approval fails; if draft persistence commits first, the saved draft remains available for owner review.
+
+MongoDB transaction/concurrency coverage against the isolated whatsapp_sales_assistant_test database is project-reported as 16/16 passing. Regular backend tests are project-reported as 130/130 passing, including 40/40 Gemini adapter tests. These results were not rerun for this documentation update and do not establish production database behavior.
+
+## Job states and owner review
+
+The model supports queued, processing, draft_ready, approved, rejected, sending, sent, send_failed, send_uncertain, failed, and cancelled states. Generation currently moves eligible jobs through queued → processing → draft_ready, or to a safe retry/failure/cancelled state. The owner can retrieve, edit-and-approve, or reject drafts through authenticated business-scoped APIs.
+
+Approval does not send. No application-level route or service currently sends an approved AI draft. Internal repository-level send reservation, completion, accepted/rejected/uncertain outcome recording, and expired reservation recovery exist as foundations only. They are not a connected provider send workflow, and they do not make automatic sending possible.
+
+Any future approved-draft sender must use those reservation/fencing operations, call WhatsApp outside database transaction callbacks, persist provider outcomes safely, and treat uncertain provider acceptance as terminal for automatic processing. An uncertain send must never be blindly retried.
+
+## Evidence and limits
+
+- **Implemented/mock-tested:** Gemini adapter, context retrieval, prompt building, processor, worker, queue transitions, owner review routes, response-mode operations, and webhook enqueue behavior have backend tests.
+- **Atlas-tested:** project-reported isolated transaction suite passed 16/16 against whatsapp_sales_assistant_test.
+- **Real Gemini:** not successfully verified; latest controlled request returned 504 and no draft persisted.
+- **Production worker:** source default is false; Render environment was not independently inspected.
+- **Browser UI:** AI Drafts end-to-end browser acceptance is not recorded here.
+
+Do not treat a passing mock test, Atlas test, typecheck, or build as proof that a live Gemini draft was successfully generated.

@@ -1,125 +1,104 @@
 # Development Roadmap
 
-## Status and schedule
+## Progress and evidence
 
-This is the planned sequence and estimate, reconciled with source and recorded verification. Implementation work for Phases 1–6 is present in the repository; acceptance evidence varies by phase. Gemini/AI behavior and human takeover (Phases 7–8) and deployment/final acceptance (Phase 9) remain pending. Code presence, mock checks, browser testing, and live provider verification are tracked separately below. External accounts and production configuration are not assumed complete. The original 13–16 week estimate is a planning estimate, not a completed schedule.
+This roadmap reflects source inspection and recorded project test reports. It does not treat code presence as proof of live integration. Verification results below were supplied by the project team and were not rerun during this documentation update.
 
-### Progress and verification summary
-
-| Area | Implementation status | Verification evidence |
+| Work area | Implementation status | Verification evidence |
 |---|---|---|
-| Project foundation, auth, profile, catalog, FAQ | Implemented. | Recent typechecks/builds passed; Phase 4 API/UI manual verification was reported by the project team. |
-| Conversation/message models and APIs; inbox/composer/history refresh | Implemented. | Recent frontend/backend typechecks and builds passed. Phase 5 browser testing is not recorded as verified. |
-| Webhook verification, incoming text ingestion, outgoing text service/API, delivery/read/failure statuses | Implemented in source. | Isolated/mock ingestion and status-transition checks passed; no live Meta callback or WhatsApp send/receive is verified. |
-| WhatsApp number configuration and safe failure-detail display | Implemented in source. | Step 5.9.2/5.9.4 typechecks/builds passed; isolated schema/serialization checks passed. No live number verification exists. |
-| Gemini response generation and human takeover/resume | Not implemented. | Not tested. |
-| Atlas/Meta/WhatsApp production end-to-end flow | Pending live verification. | Not verified by recent implementation checks. |
+| Project foundation and authentication | Implemented: React/Vite/TypeScript, Express/TypeScript, MongoDB/Mongoose, auth and protected frontend flows. | Recent builds/typechecks reported passing; backend test suite exists. |
+| Business profile, catalog, and FAQ | Implemented in backend and frontend, including business-scoped APIs and catalog pagination. | Phase 4 manual API/UI testing was reported by the project team; automated frontend/browser evidence is not in the repository. |
+| WhatsApp webhook and inbox | Implemented: callback verification/signatures, inbound text ingestion/status events, conversation/history APIs, manual outgoing text endpoint, inbox/composer. | Project previously reported live inbound and outbound WhatsApp messages. A separate Meta Verify and Save issue was reported; full end-to-end acceptance is not established. |
+| AI job queue and takeover fence | Implemented: transactional webhook enqueue under the global gate and AI mode, job claims/leases, conversation control fence, stale-draft checks. | Project-reported isolated Atlas transaction suite: 16/16 passed. Regular backend suite: 130/130 reported. |
+| Gemini adapter, context, prompt, and draft processor | Implemented in source; worker creates owner-review drafts only. | Mock/unit tests reported passing (Gemini subset 40/40); controlled real Gemini generation last returned HTTP 504 and saved no draft. |
+| Draft review UI and APIs | Implemented in source: list/detail, source inbound message, edit/approve/reject, response-mode read/update. | Backend test/build evidence is reported. AI Drafts browser acceptance is not evidenced. |
+| Approved AI draft sending | Not implemented at application/API/UI level. Internal repository send reservation/completion/outcome/recovery functions exist. | Repository-level transaction behavior has Atlas integration coverage, but no application provider send flow exists to accept as end-to-end tested. |
+| Production worker state | Source default is disabled. | Render environment configuration was not independently inspected; do not claim the deployed flag value is verified. |
 
-The repository does not currently provide a repeatable project-wide automated test suite. “Mock-tested” above refers only to the isolated checks stated; it does not mean all APIs or external integrations have been tested.
+The latest controlled real Gemini test reported a 504 provider_5xx response, one generation attempt, retry scheduling, and no persisted draft. No successful real Gemini generation has been demonstrated.
 
-## Phases
+## Implemented areas
 
-### Phase 1 — Architecture and planning (about 1 week)
+The project foundation, authentication, business management, WhatsApp messaging/inbox, and Phase 6 draft-first AI components are present in source. The Phase 6 source includes the adapter, context/prompt services, worker, transactional webhook enqueue, review APIs/UI, and response-mode controls. Presence in source is not the same as successful live provider operation.
 
-- **Status:** Planning documents are present and have been reconciled with current implementation status; outstanding AI and live-integration decisions remain open.
+No Step 6.11 is specified in the inspected roadmap. The remaining work below is organized by dependency and deliverable; it does not assign a historical step number.
 
-- **Objective:** Agree Version 1.0 scope, data contracts, safety behavior, and unresolved decisions.
-- **Dependencies:** Project requirements and team review.
-- **Work items:** Review the six docs; decide open questions that block implementation; identify external accounts and test data plan.
-- **Acceptance criteria:** Cross-document review passes; owner-approved decisions are recorded; no feature is described as implemented without evidence.
-- **Deliverables:** Reviewed architecture, schemas, API design, roadmap, and task list.
+## Remaining work in dependency order
 
-### Phase 2 — Project foundations (about 1 week)
+### 1. Complete controlled Gemini generation proof
 
-- **Status:** Implemented: React/Vite/TypeScript frontend, Express/TypeScript backend, validated backend environment configuration, security middleware, health API, and frontend/backend API client communication.
+**Required for a functioning AI-draft MVP demo.**
 
-- **Objective:** Establish a small maintainable frontend/backend development setup.
-- **Dependencies:** Phase 1; selected runtime/tool versions.
-- **Work items:** Frontend and backend setup, configuration strategy, safe secret handling, basic error handling, linting and formatting.
-- **Acceptance criteria:** Both local development processes start; configuration validation fails clearly when required values are missing; no credentials are committed.
-- **Deliverables:** Project skeleton, documented local setup, baseline lint/format commands.
+- Resolve or investigate the reported HTTP 504 in an isolated test setup.
+- Run the existing one-job harness only after reviewing its current safety and isolation safeguards.
+- Use synthetic business/customer/message data and the isolated test database.
+- Confirm one successful real draft is persisted, is within bounds, leaves the conversation in AI mode, and creates no outbound message.
+- Keep worker activation restricted to a controlled non-production environment. The production worker setting has not been verified and must remain disabled per project policy.
 
-### Phase 3 — Database and authentication (about 2 weeks)
+**Acceptance evidence:** a sanitized test result that identifies the isolated database, one processed job, persisted draft, and zero outbound/WhatsApp calls; never include secrets, prompts, or private messages.
 
-- **Status:** Implemented: MongoDB/Mongoose connection, User and Business models, registration/login/JWT, and authenticated frontend flows. Customer, Conversation, and Message models were added with the messaging work. A repeatable automated auth/isolation suite remains pending.
+### 2. Implement explicit sending for an approved AI draft
 
-- **Objective:** Persist core data and protect owner access.
-- **Dependencies:** Phase 2; MongoDB development connection; approved token design.
-- **Work items:** MongoDB Atlas connection, Mongoose models/indexes for seven collections, registration/login, bcrypt, JWT middleware, validation, rate limiting, tenant isolation.
-- **Acceptance criteria:** Owner can register/login; unique email/workspace constraints work; unauthorized and cross-business requests are rejected; secrets/hashes are not returned.
-- **Deliverables:** Data layer, authentication APIs/UI, automated tests for auth and isolation.
+**Required for an end-to-end third-semester owner-reviewed messaging flow.**
 
-### Phase 4 — Business configuration (about 1–2 weeks)
+- Add an authenticated owner-triggered application service/API for an already approved, still-current draft.
+- Integrate existing repository reservation/completion/outcome/recovery functions with the WhatsApp Cloud API adapter.
+- Revalidate business ownership, AI mode/control version, approval status, and send reservation atomically before the provider call.
+- Call Meta outside MongoDB transaction callbacks.
+- Persist accepted provider message provenance and conversation summary safely.
+- Make definitive rejection and uncertain outcome distinct. Never automatically retry an ambiguous send.
+- Do not treat approval or switching AI mode as consent to send.
 
-- **Status:** Implemented: business profile, catalog and FAQ APIs/pages, including catalog pagination. Phase 4 API/UI manual testing is reported by the project team. Automated regression tests, AI settings, and communication preferences remain pending.
+**Acceptance evidence:** provider-mocked route/service tests, isolated Atlas concurrency/rollback tests, and no duplicated outbound message under concurrent owner requests.
 
-- **Objective:** Let the owner maintain business facts for the future AI response flow.
-- **Dependencies:** Phase 3.
-- **Work items:** Business profile, products/services, FAQs, AI settings and communication preferences; integer paise handling for INR.
-- **Acceptance criteria:** Owner can create/read/update scoped records; invalid money and cross-business references are rejected. When AI retrieval is implemented, inactive facts must be excluded from its context.
-- **Deliverables:** Business configuration APIs and screens, validation tests.
+### 3. Add the owner send-confirmation UI
 
-### Phase 5 — Inbox and messaging UI (about 2 weeks)
+**Depends on Step 2 above.**
 
-- **Status:** Implemented: conversation list/history APIs, pagination, frontend inbox, older-history loading, owner text composer, status labels, failed-message title display, and manual history refresh. Typechecks/builds passed in recent steps; browser verification is not recorded as complete.
+- Show an explicit Send approved draft action only for eligible approved drafts.
+- Require a clear owner confirmation.
+- Show in-progress, definitive failure, success, and uncertain states.
+- On uncertain outcome, instruct the owner to check the conversation before taking action; do not offer automatic resend.
+- Preserve the existing manual Inbox send flow and keep AI drafts separate from automatic replies.
 
-- **Objective:** Provide an owner-facing customer inbox/history and manual message interface.
-- **Dependencies:** Phase 3; basic UI patterns from Phase 2.
-- **Work items:** Conversation list/details, message history and pagination, status/error display, and owner-triggered text sending.
-- **Acceptance criteria:** Implemented in source; browser and live end-to-end acceptance remain to be recorded.
-- **Deliverables:** Inbox/dashboard screens, conversation APIs, manual composer.
+### 4. Verify race, API, and failure behavior
 
-### Phase 6 — WhatsApp integration (about 2–3 weeks)
+**Required reliability work.**
 
-- **Status:** Integration code is implemented: optional backend Meta configuration, safe business Phone Number ID settings, GET challenge and POST signature verification, incoming text ingestion, outgoing text send, and status processing. Meta/WhatsApp live setup and verification remain pending.
+- Expand tests for AI-draft send versus Human takeover, repeated/concurrent sends, provider timeout after possible acceptance, persistence failure after provider acceptance, and lease recovery.
+- Keep real MongoDB transaction tests isolated to the exact test database and unique fixtures.
+- Add regression tests for current ingestion, approval/rejection, stale draft fencing, webhook idempotency, and business isolation.
+- Mock Gemini and WhatsApp in ordinary tests. Do not use production credentials or send real messages in automated tests.
 
-- **Objective:** Receive and send messages using an authorized Meta test setup.
-- **Dependencies:** Phase 5; Meta app/number, credentials, public HTTPS URL; current Meta requirements reviewed.
-- **Work items:** Secure configuration, GET challenge, raw-body POST signature validation, payload normalization, customer/conversation creation, duplicate handling, outbound text sends, delivery-status events.
-- **Acceptance criteria:** Mock/isolated status checks are reported as passed. Live webhook verification, controlled inbound/outbound test messages, provider status reflection, and failure behavior remain pending.
-- **Deliverables:** WhatsApp adapter and a future authorized live test record. Do not mark external integration complete until verified.
+Some existing Atlas tests already cover repository send reservations/completion and takeover races; those do not replace tests of the missing application-level route/service.
 
-### Phase 7 — Gemini integration (about 2 weeks)
+### 5. Perform browser and controlled staging acceptance
 
-- **Objective:** Generate bounded, grounded responses from business context.
-- **Dependencies:** Phase 4 and 6; Gemini account/key; chosen model/limits and approved send behavior.
-- **Work items:** Business-context retrieval, 10–15 message window subject to token limit, controlled prompt construction, response validation, bounded failure handling, controlled response tests.
-- **Acceptance criteria:** Tests check grounding, unknown info, invented prices/stock/discounts, prompt injection, insufficient facts, and Gemini outage; API key remains server-side.
-- **Deliverables:** Gemini adapter, prompt/context service, AI behavior and failure tests.
+**Depends on implementation and tests above.**
 
-### Phase 8 — Human takeover and end-to-end hardening (about 2 weeks)
+- Browser-test login/session restoration, business settings, inbox/history pagination, manual send, AI Drafts list/detail/edit/approve/reject, response-mode switching, and the explicit approved-draft send UI.
+- Use non-production business data and authorized provider test resources.
+- Verify WhatsApp webhook subscription/verification and controlled inbound/status/outbound messages.
+- Verify one successful Gemini draft before testing the complete draft-to-send path.
+- Record expected/actual results, environment class (test/staging), and sanitized evidence.
+- Keep automatic replies disabled; production worker configuration requires separate deployment review and remains disabled.
 
-- **Objective:** Coordinate owner control and complete the full message path safely.
-- **Dependencies:** Phases 3–7.
-- **Work items:** AI pause/resume, database-backed dispatch/takeover coordination, stale processing recovery, manual retry, error visibility, privacy/security review, end-to-end testing.
-- **Acceptance criteria:** Takeover before dispatch prevents sending; in-flight dispatch leaves takeover pending until resolved; ambiguous sends are not automatically resent; restart/retry behavior is visible and bounded; complete test-number flow works.
-- **Deliverables:** Takeover/resume workflow, retry/recovery behavior, end-to-end and race tests, known-limitations record.
+### 6. Final security, privacy, and release review
 
-### Phase 9 — Deployment and documentation (about 1–2 weeks)
+- Confirm production environment values privately without exposing them in logs or reports.
+- Review rate limits, webhook signature behavior, role/business scoping, safe diagnostics, retention/deletion, backup, and incident/rollback steps.
+- Reconcile docs and final demo/report claims to the evidence collected.
+- Do not claim production AI worker state based on source defaults.
 
-- **Objective:** Prepare an authorized demonstration and final project report.
-- **Dependencies:** Prior acceptance criteria; Vercel, Render, MongoDB Atlas and provider account access.
-- **Work items:** Deploy frontend to Vercel and backend to Render; configure production secrets privately; verify HTTPS webhook, CORS, database access, and logs; complete documentation/report/demo preparation.
-- **Acceptance criteria:** Authorized non-production accounts can complete the demo; no secrets are exposed; deployment and rollback/configuration steps are documented; deferred scope is not implemented.
-- **Deliverables:** Deployed demo if accounts are available, final report, test evidence, demonstration plan.
+## Testing inventory
 
-## Testing strategy
+- **Backend unit/mocked:** project-reported 130/130 tests passing, including 40/40 Gemini adapter tests. Not rerun during this documentation update.
+- **MongoDB Atlas integration:** project-reported 16/16 transaction/concurrency tests passing against the isolated whatsapp_sales_assistant_test database. Not production verification and not rerun here.
+- **Frontend automated tests:** no frontend test script or test suite was found in the package/repository inspection.
+- **Frontend browser acceptance:** not evidenced for the complete AI Drafts flow.
+- **Live WhatsApp:** bidirectional live messaging was reported by the project team; Meta Verify and Save has also been reported as unresolved. No full AI-draft send flow exists.
+- **Live Gemini:** last controlled attempt returned HTTP 504; no successful draft is verified.
 
-The following is the continuing test plan. Recent frontend/backend typechecks and production builds passed. Isolated mocked status-ingestion and number-configuration checks are reported as passed. Phase 4 manual testing is reported by the project team; Phase 5 browser verification and all live provider checks remain unverified. A repeatable automated test suite is not yet present in the repository.
+## Deferred to fourth semester
 
-- Use Postman for manual REST/auth/webhook-path exploration and appropriate automated unit/API/integration tests for repeatable checks.
-- Unit-test validation, integer-paise handling, authorization, prompt assembly, webhook normalization, deduplication, state transitions, and retry eligibility.
-- Integration-test MongoDB constraints and API business isolation; mock Gemini/Meta in ordinary CI tests.
-- Test webhook verification/signature failures, malformed payloads, duplicate events, and status updates.
-- AI behavior tests cover grounding, unknown-information handling, no invented prices/stock/discounts, prompt injection, context limits, empty/invalid output, and provider outage. Do not require exact model wording.
-- Race tests cover takeover during generation and during outbound dispatch, plus restart/ambiguous outcome behavior.
-- End-to-end test with authorized non-production Meta/Gemini accounts: inbound → persist → AI context/generation → send → status/history, and then takeover/resume.
-- Security/privacy checks cover secret handling, bcrypt, rate limits, cross-business access, log redaction, and approved deletion behavior.
-
-## Dependencies and guardrails
-
-- External accounts, quotas, credentials, Meta number setup, and deployment are not assumed ready.
-- Confirm current Meta policy, webhook and messaging-window rules from official material when the integration phase begins.
-- Avoid Redis, Kafka, Kubernetes, microservices, vector databases, and external job queues for this semester.
-- No guaranteed background processing or exactly-once external delivery is promised. Persist states, use bounded retries, make ambiguous results visible, and avoid blind resend.
-- Semester-four features remain deferred.
+Automated follow-ups and scheduled reminders, lead scoring, sales predictions, bulk campaigns, payment integration, voice AI, and multi-agent features remain out of scope.

@@ -2,7 +2,11 @@
 
 ## Status
 
-This document distinguishes implemented models and behavior from future work. The backend contains Mongoose models and indexes for `users`, `businesses`, `catalogItems`, `faqs`, `customers`, `conversations`, `messages`, and `aiReplyJobs`, plus a MongoDB connection configured to select `whatsapp_sales_assistant`. The connection code does not establish whether Atlas is reachable in a particular environment. Incoming text webhook processing, outbound Cloud API calls, webhook-driven outgoing message status updates, and a disabled-by-default draft-generation worker are implemented. Incoming webhooks do not enqueue AI jobs; the worker does not send replies. Delivery-driven UI refresh remains future behavior. Field types use MongoDB/Mongoose conventions (`ObjectId`, `String`, `Date`, `Boolean`, `Number`, and embedded objects).
+The backend declares Mongoose models for users, businesses, catalog items, FAQs, customers, conversations, messages, and AI reply jobs. Their default MongoDB collection names are users, businesses, catalogitems, faqs, customers, conversations, messages, and aireplyjobs. The configured application database is whatsapp_sales_assistant; the isolated transaction suite uses whatsapp_sales_assistant_test. A model declaration is not proof that production Atlas currently has every collection or index.
+
+Incoming text webhook processing now creates an eligible AI reply job in the same MongoDB transaction as the new inbound message and conversation control-fence increment, but only when AI_DRAFT_WORKER_ENABLED is true and the conversation responseMode is ai. With the global gate false, the message is still persisted without a job. Gemini draft generation and owner review APIs are implemented. Draft approval does not send a message. The repository has internal send-reservation/completion foundations, but no application route/service that sends an approved AI draft.
+
+Verification status is tracked separately: the project reports 16/16 isolated Atlas transaction/concurrency tests passing and 130/130 regular backend tests passing, including a 40/40 Gemini adapter subset. These results were not rerun for this documentation update. A controlled real Gemini generation last returned HTTP 504 and did not persist a draft. Production collection/index state has not been verified in this documentation task. Types use MongoDB/Mongoose ObjectId, String, Date, Boolean, Number, and embedded objects.
 
 ## Collections and fields
 
@@ -30,7 +34,7 @@ This document distinguishes implemented models and behavior from future work. Th
 | `contactDetails` | Object | Optional owner-configured public details; current profile API supports phone, email, website, and address. |
 | `timezone` | String | Optional IANA timezone for display. |
 | `whatsapp` | Object | One `phoneNumberId`, display number, `connectionStatus`, and credential reference/metadata. Current UI states are `not_configured` and `configured_not_verified`; a saved ID alone is not a verified Meta connection. Never plaintext tokens. |
-| `aiSettings` | Object | `enabledByDefault`, model identifier/configuration, context-message limit, and communication preferences. No secrets. |
+| aiSettings | Object | Schema fields include enabledByDefault, model identifier/configuration, context-message limit, and communication preferences. No secrets. These fields currently have no owner API/UI and are not used by context retrieval or prompt construction; the Gemini model comes from backend configuration. |
 | `createdAt`, `updatedAt` | Date | Timestamps. |
 
 MVP relationship: each owner has exactly one business, and each business has exactly one owner. Enforce uniqueness of `businesses.ownerUserId` and of `users.businessId` (required). Adding operators later may change the one-to-many user relationship.
@@ -86,7 +90,7 @@ The model enforces uniqueness of `{ businessId, phoneNumber }` and validates the
 | `customerId` | ObjectId | Required reference to a customer in the same business. |
 | `status` | String | Required `open` or `closed`; defaults to `open`. |
 | `responseMode` | String | `human` or `ai`; defaults to `human`. `ai` permits draft generation only when the worker is enabled; it does not authorize sending. |
-| `aiControlVersion` | Number | Internal non-negative integer write fence. Draft completion and human takeover increment it on this same document to serialize their transactions/updates. It is not an owner-facing field. |
+| `aiControlVersion` | Number | Internal non-negative integer write fence. Inbound message persistence, draft persistence, approval, and response-mode changes coordinate through conditional/transactional updates on this same document. It is not an owner-facing field. |
 | `lastMessageAt` | Date | Optional timestamp used for conversation ordering. |
 | `lastMessagePreview` | String | Optional trimmed preview, limited to 280 characters. |
 | `createdAt`, `updatedAt` | Date | Timestamps. |
@@ -114,25 +118,32 @@ The model enforces one conversation per `{ businessId, customerId }`. Response m
 
 Outbound records may be created without a provider message ID; the ID is optional and must only be stored when supplied by the provider. No access tokens or other credentials are stored in message documents. Webhook status processing matches only outgoing messages by business and provider ID. Successful statuses advance `sent` → `delivered` → `read`; older events do not regress state. At equal timestamps, the forward successful progression wins, while `failed` can replace `sent` but does not replace `delivered` or `read`. A recorded `failed` status is terminal. Duplicate or non-advancing events do not rewrite the message. Failure code/title are stored only when available and within the field limits. Delivery status is not a retry/send queue and does not automatically alter provider sends.
 
-### `aiReplyJobs`
+### aireplyjobs (Mongoose model: AiReplyJob)
 
-This internal collection stores durable owner-review draft work. Webhook ingestion does not enqueue jobs yet, and a `draft_ready` job is not a sent message.
+This collection stores durable AI draft work and owner-review state. Webhook ingestion creates one job for a newly persisted inbound text message only when the shared AI_DRAFT_WORKER_ENABLED gate is true and the conversation is in AI mode. This creation is in the same transaction as message persistence and the conversation fence increment. Worker processing remains a separate lifecycle.
 
 | Field | Type | Notes |
 |---|---|---|
-| `_id` | ObjectId | Job identifier. |
-| `businessId` | ObjectId | Required business scope. |
-| `conversationId` | ObjectId | Required reference to the conversation. |
-| `inboundMessageId` | ObjectId | Required triggering inbound message; unique per business/job. |
-| `status` | String | `queued`, `processing`, `draft_ready`, `failed`, or `cancelled`. |
-| `attemptCount` | Number | Non-negative safe integer used as a completion fencing token; at most three attempts are claimed. |
-| `nextAttemptAt` | Date | Earliest eligible retry/claim time. |
-| `lockedAt`, `leaseExpiresAt` | Date | Optional processing lease fields. |
-| `generatedDraft` | String | Optional bounded draft (maximum 4096 characters) for owner review only. |
-| `errorCode` | String | Optional safe category such as `context_unavailable`, `provider_timeout`, `database_unavailable`, or `invalid_output`; no raw provider/database errors. |
-| `createdAt`, `updatedAt` | Date | Timestamps. |
+| _id | ObjectId | Job identifier. |
+| businessId | ObjectId | Required business scope. |
+| conversationId | ObjectId | Required reference to the conversation. |
+| inboundMessageId | ObjectId | Required triggering inbound message; unique per business/job. |
+| status | String | queued, processing, draft_ready, approved, rejected, sending, sent, send_failed, send_uncertain, failed, or cancelled. Sending-related states are repository foundations; the application-level approved-draft send flow is not implemented. |
+| attemptCount | Number | Non-negative safe integer used to fence worker attempts; at most three generation attempts are claimed. |
+| nextAttemptAt | Date | Earliest eligible claim/retry time. |
+| lockedAt, leaseExpiresAt | Date | Optional generation-worker lease fields. |
+| generatedDraft | String | Optional validated draft, up to 4096 characters, for owner review. |
+| draftControlVersion | Number | Conversation aiControlVersion captured for the draft. |
+| approvedText | String | Owner-approved generated or edited text. Approval does not send. |
+| approvedByUserId, approvedAt | ObjectId, Date | Owner approval audit fields. |
+| approvalEdited | Boolean | Whether approved text differs from the generated text. |
+| rejectedByUserId, rejectedAt, rejectionReason | ObjectId, Date, String | Owner rejection audit data; reason is bounded to 500 characters. |
+| sendAttemptId, sendStartedAt, sendLeaseExpiresAt, sendFinishedAt | String, Date | Internal fields for send-reservation foundations. |
+| sendOutcome, sendErrorCode, providerStatusCode, providerMessageId, outboundMessageId | String, Number, ObjectId | Internal completion/uncertainty provenance. No credentials or raw provider errors are stored. |
+| errorCode | String | Safe generation failure category; no raw provider/database error. |
+| createdAt, updatedAt | Date | Timestamps. |
 
-The worker uses atomic claims and attempt/lease-fenced retry, failure, cancellation, and draft-completion transitions. It does not create an outbound `Message` or call WhatsApp.
+The worker uses atomic claims and attempt/lease-fenced retries, failures, cancellations, and draft completion. It calls Gemini outside transaction callbacks and saves a draft only after the AI-mode/control-fence checks. It does not create an outbound Message or call WhatsApp. The latest controlled real Gemini test returned HTTP 504; it persisted no generatedDraft. Repository-level send reservation, completion, definitive failure, uncertain outcome, and expired-reservation recovery functions exist, but they are not wired to an application-level approved-draft send operation. An uncertain send must not be retried automatically.
 
 ## Relationships
 
@@ -150,7 +161,7 @@ erDiagram
   MESSAGES ||--o| AI_REPLY_JOBS : triggers
 ```
 
-All records owned by a business (`catalogItems`, `faqs`, `customers`, `conversations`, `messages`, and `aiReplyJobs`) contain `businessId`. The owner/business relationship is one-to-one in the MVP; future operators are not part of current scope. Mongoose `ref` declarations describe ObjectId relationships but do not enforce that referenced records exist or belong to the same business. Services must validate those relationships and scope all reads/writes using authenticated, verified, or trusted persisted job ownership.
+All business-owned collections (catalogitems, faqs, customers, conversations, messages, and aireplyjobs) contain businessId.
 
 ## Conversation reuse and lifecycle
 
@@ -158,18 +169,18 @@ The current MVP model allows one conversation per customer per business and enfo
 
 ## Indexes
 
-The following indexes are declared in the current Mongoose models:
+These names and key patterns are declared in the Mongoose schemas. They describe application declarations, not proof that a production database currently has the indexes.
 
-- `users`: unique `{ email: 1 }` and unique `{ businessId: 1 }`.
-- `businesses`: unique `{ ownerUserId: 1 }`.
-- `catalogItems`: `{ businessId: 1, isActive: 1, kind: 1 }`.
-- `faqs`: `{ businessId: 1, isActive: 1 }`.
-- `customers`: unique `{ businessId: 1, phoneNumber: 1 }`.
-- `conversations`: unique `{ businessId: 1, customerId: 1 }`; `{ businessId: 1, status: 1, lastMessageAt: -1 }` for business-scoped conversation ordering.
-- `messages`: unique partial `{ businessId: 1, providerMessageId: 1 }` for non-empty provider IDs; `{ businessId: 1, conversationId: 1, createdAt: -1 }` for conversation history; `{ businessId: 1, createdAt: -1 }` for business-scoped retrieval.
-- `aiReplyJobs`: unique `{ businessId: 1, inboundMessageId: 1 }`; `{ businessId: 1, status: 1, nextAttemptAt: 1, createdAt: 1 }` for scoped claims; `{ businessId: 1, status: 1, leaseExpiresAt: 1 }` for scoped lease recovery; `{ businessId: 1, conversationId: 1, createdAt: -1 }` for conversation history; `{ status: 1, nextAttemptAt: 1, createdAt: 1 }` and `{ status: 1, leaseExpiresAt: 1, attemptCount: 1 }` support the global worker's queue claim and expired-lease recovery.
+- users: users_email_unique, unique { email: 1 }; users_business_id_unique, unique { businessId: 1 }.
+- businesses: businesses_owner_user_id_unique, unique { ownerUserId: 1 }.
+- catalogitems: catalog_items_business_active_kind, { businessId: 1, isActive: 1, kind: 1 }.
+- faqs: faqs_business_active, { businessId: 1, isActive: 1 }.
+- customers: customers_business_phone_unique, unique { businessId: 1, phoneNumber: 1 }.
+- conversations: conversations_business_customer_unique, unique { businessId: 1, customerId: 1 }; conversations_business_status_last_message, { businessId: 1, status: 1, lastMessageAt: -1 }.
+- messages: messages_business_provider_id_unique, unique { businessId: 1, providerMessageId: 1 }, partial filter { providerMessageId: { $type: "string", $gt: "" } }; messages_business_conversation_history, { businessId: 1, conversationId: 1, createdAt: -1 }; messages_business_created_at, { businessId: 1, createdAt: -1 }; messages_business_ai_reply_job_unique, unique { businessId: 1, aiReplyJobId: 1 }, partial filter { aiReplyJobId: { $type: "objectId" } }.
+- aireplyjobs: ai_reply_jobs_business_inbound_unique, unique { businessId: 1, inboundMessageId: 1 }; ai_reply_jobs_business_pending, { businessId: 1, status: 1, nextAttemptAt: 1, createdAt: 1 }; ai_reply_jobs_worker_pending, { status: 1, nextAttemptAt: 1, createdAt: 1 }; ai_reply_jobs_business_expired_leases, { businessId: 1, status: 1, leaseExpiresAt: 1 }; ai_reply_jobs_worker_expired_leases, { status: 1, leaseExpiresAt: 1, attemptCount: 1 }; ai_reply_jobs_business_conversation, { businessId: 1, conversationId: 1, createdAt: -1 }; ai_reply_jobs_business_review, { businessId: 1, status: 1, createdAt: -1, _id: -1 }; ai_reply_jobs_one_sending_per_conversation, unique { businessId: 1, conversationId: 1 }, partial filter { status: "sending" }.
 
-These indexes are declared in the current Mongoose models. They support scoped lookup and duplicate-ID prevention, but index creation in a running Atlas database depends on model/index initialization. Webhook handlers treat duplicate-key conflicts as already-persisted events only after verifying the matching business/provider ID. Status updates include business ID, provider message ID, and outbound direction in their query and use conditional updates to avoid overwriting concurrent newer state.
+The unique job index prevents duplicate queue work for the same inbound message. The partial sending index permits at most one sending job per business/conversation. Message provenance uniqueness prevents duplicate outbound Message records for an AI job. The project reports that the isolated Atlas transaction suite checked/used the relevant indexes and passed 16/16; this does not verify production Atlas indexes. Do not run index synchronization or modify production indexes as part of this documentation.
 
 ## Example documents
 
@@ -180,7 +191,6 @@ Illustrative placeholders only; no real customer or configured account is implie
   "_id": "665000000000000000000001",
   "ownerUserId": "665000000000000000000010",
   "name": "Northside Bakery",
-  "aiSettings": { "enabledByDefault": true, "contextMessageLimit": 12 },
   "whatsapp": { "connectionStatus": "not_configured" }
 }
 ```
