@@ -23,6 +23,51 @@ export type GeminiServiceErrorCategory =
   | "output_too_large"
   | "provider_error";
 
+export type GeminiProviderDiagnosticCategory =
+  | "rate_limited"
+  | "authentication_failed"
+  | "permission_denied"
+  | "timeout"
+  | "network_error"
+  | "provider_5xx"
+  | "provider_error";
+
+export interface GeminiProviderDiagnostic {
+  readonly category: GeminiProviderDiagnosticCategory;
+  readonly httpStatus?: number;
+  readonly networkCode?: string;
+}
+
+const allowedHttpStatuses = new Set([400, 401, 403, 404, 408, 409, 422, 429, 500, 502, 503, 504]);
+const allowedNetworkCodes = new Set([
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EPIPE",
+  "ETIMEDOUT",
+]);
+
+// These names correspond to the SDK's known API and HTTP-client error classes.
+// The classes beneath GoogleGenAI's public ApiError are not exported by the SDK.
+const sdkApiErrorNames = new Set([
+  "APIError",
+  "BadRequestError",
+  "AuthenticationError",
+  "PermissionDeniedError",
+  "NotFoundError",
+  "ConflictError",
+  "UnprocessableEntityError",
+  "RateLimitError",
+  "InternalServerError",
+]);
+const sdkTimeoutErrorNames = new Set(["APIConnectionTimeoutError", "RequestTimeoutError"]);
+const sdkConnectionErrorNames = new Set(["APIConnectionError", "ConnectionError"]);
+const sdkAbortErrorNames = new Set(["APIUserAbortError", "RequestAbortedError"]);
+
 const publicMessages: Record<GeminiServiceErrorCategory, string> = {
   missing_credentials: "Gemini is not configured.",
   invalid_request: "The text-generation request is invalid.",
@@ -39,11 +84,13 @@ const publicMessages: Record<GeminiServiceErrorCategory, string> = {
 
 export class GeminiServiceError extends Error {
   readonly category: GeminiServiceErrorCategory;
+  readonly diagnostic: GeminiProviderDiagnostic | undefined;
 
-  constructor(category: GeminiServiceErrorCategory) {
+  constructor(category: GeminiServiceErrorCategory, diagnostic?: GeminiProviderDiagnostic) {
     super(publicMessages[category]);
     this.name = "GeminiServiceError";
     this.category = category;
+    this.diagnostic = diagnostic;
   }
 }
 
@@ -77,38 +124,106 @@ function createSdkProvider(apiKey: string): GeminiTextProvider {
   };
 }
 
-function statusFromError(error: unknown): number | undefined {
-  if (error instanceof ApiError) return error.status;
+function ownDataValue(value: object, key: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor && "value" in descriptor ? descriptor.value : undefined;
+}
+
+function sdkErrorName(error: unknown): string | undefined {
+  if (!(error instanceof Error)) return undefined;
+  const name = ownDataValue(error, "name");
+  return typeof name === "string" ? name : undefined;
+}
+
+function verifiedSdkErrorName(error: unknown): string | undefined {
+  const name = sdkErrorName(error);
+  if (!name) return undefined;
+  if (error instanceof ApiError || sdkApiErrorNames.has(name) ||
+    sdkTimeoutErrorNames.has(name) || sdkConnectionErrorNames.has(name) ||
+    sdkAbortErrorNames.has(name)) {
+    return name;
+  }
+  return undefined;
+}
+
+function verifiedHttpStatus(error: unknown, name: string): number | undefined {
+  if (!(error instanceof ApiError) && !sdkApiErrorNames.has(name)) return undefined;
   if (typeof error !== "object" || error === null) return undefined;
 
-  const status = "status" in error ? error.status : undefined;
-  if (typeof status === "number") return status;
-  const statusCode = "statusCode" in error ? error.statusCode : undefined;
-  return typeof statusCode === "number" ? statusCode : undefined;
+  const status = ownDataValue(error, "status");
+  const statusCode = ownDataValue(error, "statusCode");
+  if (status !== undefined && statusCode !== undefined && status !== statusCode) return undefined;
+  const candidate = status ?? statusCode;
+  return typeof candidate === "number" && Number.isInteger(candidate) &&
+      allowedHttpStatuses.has(candidate)
+    ? candidate
+    : undefined;
 }
 
-function nameFromError(error: unknown): string {
-  if (typeof error !== "object" || error === null || !("name" in error)) return "";
-  return typeof error.name === "string" ? error.name.toLowerCase() : "";
+function knownNetworkCode(error: unknown): string | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth <= 2; depth += 1) {
+    if (typeof current !== "object" || current === null) return undefined;
+    const code = ownDataValue(current, "code");
+    if (typeof code === "string" && allowedNetworkCodes.has(code)) return code;
+    if (depth === 2) return undefined;
+    current = ownDataValue(current, "cause");
+  }
+  return undefined;
 }
 
-function categoryFromProviderError(error: unknown): GeminiServiceErrorCategory {
-  const status = statusFromError(error);
-  if (status === 429) return "rate_limited";
-  if (status === 401) return "authentication_failed";
-  if (status === 403) return "permission_denied";
-
-  const name = nameFromError(error);
-  if (
-    name.includes("timeout") ||
-    name.includes("abort") ||
-    (typeof error === "object" && error !== null && "code" in error &&
-      (error.code === "ETIMEDOUT" || error.code === "ECONNABORTED"))
-  ) {
-    return "timeout";
+function classifyProviderError(error: unknown): {
+  category: GeminiServiceErrorCategory;
+  diagnostic: GeminiProviderDiagnostic;
+} {
+  const name = verifiedSdkErrorName(error);
+  if (!name) {
+    return { category: "provider_error", diagnostic: { category: "provider_error" } };
   }
 
-  return "provider_error";
+  const httpStatus = verifiedHttpStatus(error, name);
+  if (httpStatus === 429) {
+    return { category: "rate_limited", diagnostic: { category: "rate_limited", httpStatus } };
+  }
+  if (httpStatus === 401) {
+    return { category: "authentication_failed", diagnostic: { category: "authentication_failed", httpStatus } };
+  }
+  if (httpStatus === 403) {
+    return { category: "permission_denied", diagnostic: { category: "permission_denied", httpStatus } };
+  }
+  if (httpStatus !== undefined && httpStatus >= 500) {
+    return { category: "provider_error", diagnostic: { category: "provider_5xx", httpStatus } };
+  }
+
+  if (sdkTimeoutErrorNames.has(name) || sdkAbortErrorNames.has(name)) {
+    return {
+      category: "timeout",
+      diagnostic: { category: "timeout", ...(httpStatus === undefined ? {} : { httpStatus }) },
+    };
+  }
+
+  if (httpStatus === 408) {
+    return { category: "provider_error", diagnostic: { category: "timeout", httpStatus } };
+  }
+
+  if (sdkConnectionErrorNames.has(name)) {
+    const networkCode = knownNetworkCode(error);
+    return {
+      category: "provider_error",
+      diagnostic: {
+        category: "network_error",
+        ...(networkCode === undefined ? {} : { networkCode }),
+      },
+    };
+  }
+
+  return {
+    category: "provider_error",
+    diagnostic: {
+      category: "provider_error",
+      ...(httpStatus === undefined ? {} : { httpStatus }),
+    },
+  };
 }
 
 export function createGeminiService(
@@ -170,7 +285,8 @@ export function createGeminiService(
       return { text, model: options.model };
     } catch (error) {
       if (error instanceof GeminiServiceError) throw error;
-      throw new GeminiServiceError(categoryFromProviderError(error));
+      const classified = classifyProviderError(error);
+      throw new GeminiServiceError(classified.category, classified.diagnostic);
     }
   }
 

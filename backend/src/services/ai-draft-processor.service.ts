@@ -14,6 +14,7 @@ import {
 } from "./ai-reply-job.repository.js";
 import {
   GeminiServiceError,
+  type GeminiProviderDiagnostic,
   type GeminiTextGenerationResult,
 } from "./gemini.service.js";
 import {
@@ -166,6 +167,19 @@ function validateDraft(value: unknown): string | null {
   return text;
 }
 
+function safeGeminiDiagnosticFields(error: GeminiServiceError): {
+  providerCategory: AiPipelineProviderCategory;
+  providerHttpStatus?: number;
+  providerNetworkCode?: string;
+} {
+  const diagnostic: GeminiProviderDiagnostic | undefined = error.diagnostic;
+  return {
+    providerCategory: diagnostic?.category ?? error.category,
+    ...(diagnostic?.httpStatus === undefined ? {} : { providerHttpStatus: diagnostic.httpStatus }),
+    ...(diagnostic?.networkCode === undefined ? {} : { providerNetworkCode: diagnostic.networkCode }),
+  };
+}
+
 function categorizeGeminiFailure(error: unknown): {
   retryable: boolean;
   errorCode: "provider_unavailable" | "provider_timeout" | "invalid_output" | "internal_error";
@@ -179,11 +193,7 @@ function categorizeGeminiFailure(error: unknown): {
       : { retryable: false, errorCode: "internal_error" };
   }
 
-  const diagnosticFields = {
-    providerCategory: error.diagnostic?.category ?? error.category,
-    ...(error.diagnostic?.httpStatus === undefined ? {} : { providerHttpStatus: error.diagnostic.httpStatus }),
-    ...(error.diagnostic?.networkCode === undefined ? {} : { providerNetworkCode: error.diagnostic.networkCode }),
-  };
+  const diagnosticFields = safeGeminiDiagnosticFields(error);
 
   switch (error.category) {
     case "timeout":
