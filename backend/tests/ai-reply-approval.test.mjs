@@ -253,6 +253,20 @@ test('resuming AI mode increments the fence and leaves older drafts stale', asyn
   })
 })
 
+test('legacy conversations without responseMode use Human as the default and can switch to AI', async () => {
+  await withRepositoryMocks(async (state) => {
+    delete state.conversation.responseMode
+    state.conversation.aiControlVersion = 4
+
+    assert.deepEqual(await takeOverConversation(businessId, conversationId), { kind: 'already_human' })
+    assert.deepEqual(await setConversationResponseMode(businessId, conversationId, 'ai'), {
+      kind: 'updated', responseMode: 'ai',
+    })
+    assert.equal(state.conversation.responseMode, 'ai')
+    assert.equal(state.conversation.aiControlVersion, 5)
+  })
+})
+
 test('confirmed send persists provenance and clears the active marker atomically', async () => {
   await withRepositoryMocks(async (state) => {
     state.job.status = 'sending'
@@ -301,6 +315,33 @@ test('expired send lease becomes uncertain and is not queued for another attempt
     assert.equal(state.job.sendErrorCode, 'send_lease_expired')
     assert.equal(state.conversation.activeAiSendJobId, undefined)
     assert.deepEqual(await reserveAiReplyDraftForSending({ businessId, jobId, now }), { kind: 'conflict' })
+  })
+})
+
+test('send recovery leaves a non-expired reservation and its marker unchanged', async () => {
+  await withRepositoryMocks(async (state) => {
+    state.job.status = 'sending'
+    state.job.sendAttemptId = 'attempt-live'
+    state.job.sendLeaseExpiresAt = new Date(now.getTime() + 1)
+    state.conversation.activeAiSendJobId = jobId
+
+    assert.equal(await recoverExpiredAiReplySendReservations(now), 0)
+    assert.equal(state.job.status, 'sending')
+    assert.equal(state.conversation.activeAiSendJobId, jobId)
+  })
+})
+
+test('send recovery cannot clear a conversation marker belonging to another business', async () => {
+  await withRepositoryMocks(async (state) => {
+    state.job.status = 'sending'
+    state.job.businessId = otherBusinessId
+    state.job.sendAttemptId = 'attempt-other-business'
+    state.job.sendLeaseExpiresAt = new Date(now.getTime() - 1)
+    state.conversation.activeAiSendJobId = jobId
+
+    assert.equal(await recoverExpiredAiReplySendReservations(now), 0)
+    assert.equal(state.job.status, 'sending')
+    assert.ok(state.conversation.activeAiSendJobId)
   })
 })
 
