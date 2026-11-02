@@ -3,6 +3,7 @@ import { Types } from "mongoose";
 import { z } from "zod";
 import { authenticate } from "../../middleware/auth.middleware.js";
 import type { AiReplyJobStatus } from "../../models/ai-reply-job.model.js";
+import { sendApprovedAiReply } from "../../services/ai-reply-send.service.js";
 import {
   AI_REPLY_DRAFT_PAGE_LIMIT,
   findAiReplyDraft,
@@ -47,6 +48,7 @@ const approvalBodySchema = z.object({
 const rejectionBodySchema = z.object({
   reason: z.string().trim().max(500).optional(),
 }).strict();
+const emptyBodySchema = z.object({}).strict();
 
 export interface AiDraftsRouteDependencies {
   listDrafts: typeof listAiReplyDrafts;
@@ -54,6 +56,7 @@ export interface AiDraftsRouteDependencies {
   findDraft: typeof findAiReplyDraft;
   approveDraft: typeof approveAiReplyDraft;
   rejectDraft: typeof rejectAiReplyDraft;
+  sendDraft(input: Parameters<typeof sendApprovedAiReply>[0]): ReturnType<typeof sendApprovedAiReply>;
   conversationExists(conversationId: Types.ObjectId, businessId: Types.ObjectId): Promise<boolean>;
 }
 
@@ -63,6 +66,7 @@ const mongooseDependencies: AiDraftsRouteDependencies = {
   findDraft: findAiReplyDraft,
   approveDraft: approveAiReplyDraft,
   rejectDraft: rejectAiReplyDraft,
+  sendDraft: sendApprovedAiReply,
   conversationExists: async (conversationId, businessId) =>
     Boolean(await Conversation.exists({ _id: conversationId, businessId })),
 };
@@ -177,6 +181,96 @@ export function createAiDraftsRouter(
       }
 
       response.status(200).json({ success: true, draft: safeDraft(draft) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post("/:draftId/send", async (request, response, next) => {
+    const auth = request.auth;
+    if (!auth) {
+      response.status(401).json({ success: false, message: "Authentication required." });
+      return;
+    }
+
+    const parsedId = objectIdSchema.safeParse(request.params.draftId);
+    if (!parsedId.success) {
+      response.status(400).json({ success: false, message: "Invalid AI draft ID." });
+      return;
+    }
+
+    const parsedBody = emptyBodySchema.safeParse(request.body);
+    if (!parsedBody.success) {
+      response.status(400).json({
+        success: false,
+        message: "AI draft sending does not accept request fields.",
+        errors: validationErrors(parsedBody.error.issues),
+      });
+      return;
+    }
+
+    try {
+      const result = await dependencies.sendDraft({
+        businessId: new Types.ObjectId(auth.businessId),
+        draftId: new Types.ObjectId(parsedId.data),
+        ownerUserId: new Types.ObjectId(auth.userId),
+      });
+
+      if (result.kind === "sent") {
+        response.status(200).json({
+          success: true,
+          message: "Approved AI draft sent successfully.",
+          draft: { id: result.draftId, status: "sent" },
+          data: { message: result.message },
+        });
+        return;
+      }
+
+      if (result.kind === "already_sent") {
+        response.status(200).json({
+          success: true,
+          message: "This approved AI draft was already sent.",
+          draft: { id: result.draftId, status: "sent", alreadySent: true },
+        });
+        return;
+      }
+
+      if (result.kind === "not_found") {
+        response.status(404).json({ success: false, message: "AI draft not found." });
+        return;
+      }
+
+      if (result.kind === "not_configured") {
+        response.status(503).json({ success: false, message: "WhatsApp sending is not configured." });
+        return;
+      }
+
+      if (result.kind === "send_failed") {
+        response.status(502).json({
+          success: false,
+          message: "WhatsApp did not accept the approved message.",
+          draft: { id: result.draftId, status: "send_failed" },
+        });
+        return;
+      }
+
+      if (result.kind === "outcome_uncertain") {
+        response.status(202).json({
+          success: true,
+          message: "WhatsApp acceptance could not be confirmed. Check the conversation before taking further action; this message will not be retried automatically.",
+          draft: { id: result.draftId, status: "outcome_uncertain" },
+        });
+        return;
+      }
+
+      const message = result.reason === "already_sending"
+        ? "A WhatsApp send is already in progress for this conversation."
+        : result.reason === "mode_changed"
+          ? "AI replies are not enabled for this conversation."
+          : result.reason === "stale_approval"
+            ? "This approval is stale and must be reviewed again."
+            : "This AI draft is not available to send.";
+      response.status(409).json({ success: false, message, code: result.reason });
     } catch (error) {
       next(error);
     }

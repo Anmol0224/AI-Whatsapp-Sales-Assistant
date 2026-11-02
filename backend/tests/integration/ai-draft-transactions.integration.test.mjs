@@ -12,6 +12,7 @@ import {
   claimQueuedAiReplyJob,
   completeAiReplySend,
   rejectAiReplyDraft,
+  recoverExpiredAiReplySendReservations,
   reserveAiReplyDraftForSending,
   saveAiReplyDraft,
   setConversationResponseMode,
@@ -569,7 +570,173 @@ test("real approval and send reservation serialize with takeover; confirmed comp
   assert.equal(message?.aiReplyJobId?.toString(), fixture.jobId.toString());
   assert.equal(message?.direction, "outbound");
   assert.equal(message?.status, "sent");
+
+  const replay = await completeAiReplySend({
+    businessId: fixture.businessId,
+    jobId: fixture.jobId,
+    sendAttemptId: reservation.sendAttemptId,
+    providerMessageId: `wamid.integration-${new Types.ObjectId().toString()}`,
+  });
+  assert.equal(replay.kind, "already_sent");
+  assert.equal(
+    await Message.countDocuments({ businessId: fixture.businessId, aiReplyJobId: fixture.jobId }).exec(),
+    1,
+  );
 });
+
+test("concurrent reservations for one approved draft allow only one active send", async () => {
+  const fixture = await createDraftReadyFixture();
+  const approval = await approveAiReplyDraft({
+    businessId: fixture.businessId,
+    userId: new Types.ObjectId(),
+    jobId: fixture.jobId,
+  });
+  assert.equal(approval.kind, "approved");
+
+  const results = await withMongoCommandBarrier(
+    "competing AI send reservation conversation update",
+    (query) => {
+      const filter = query.getFilter();
+      return query.op === "findOneAndUpdate" &&
+        query.model?.modelName === "Conversation" &&
+        filter._id?.toString() === fixture.conversationId.toString() &&
+        filter.businessId?.toString() === fixture.businessId.toString();
+    },
+    () => Promise.allSettled([
+      reserveAiReplyDraftForSending({ businessId: fixture.businessId, jobId: fixture.jobId }),
+      reserveAiReplyDraftForSending({ businessId: fixture.businessId, jobId: fixture.jobId }),
+    ]),
+  );
+  const reservationResults = assertConcurrentOperationsFulfilled("competing send reservations", results);
+  assert.equal(reservationResults.filter((result) => result.kind === "reserved").length, 1);
+  assert.equal(reservationResults.filter((result) => result.kind !== "reserved").length, 1);
+
+  const [job, conversation, sendingJobs] = await Promise.all([
+    AiReplyJob.findOne({ _id: fixture.jobId, businessId: fixture.businessId })
+      .select({ status: 1, sendAttemptId: 1 })
+      .lean()
+      .exec(),
+    Conversation.findOne({ _id: fixture.conversationId, businessId: fixture.businessId })
+      .select({ activeAiSendJobId: 1 })
+      .lean()
+      .exec(),
+    AiReplyJob.countDocuments({
+      businessId: fixture.businessId,
+      conversationId: fixture.conversationId,
+      status: "sending",
+    }).exec(),
+  ]);
+  assert.equal(job?.status, "sending");
+  assert.ok(job?.sendAttemptId);
+  assert.equal(conversation?.activeAiSendJobId?.toString(), fixture.jobId.toString());
+  assert.equal(sendingJobs, 1);
+})
+
+test("real recovery expires only overdue reservations and clears each matching business conversation marker", async () => {
+  const expiredFixture = await createDraftReadyFixture();
+  const otherBusinessFixture = await createDraftReadyFixture();
+  const mismatchedMarkerFixture = await createDraftReadyFixture();
+  const liveFixture = await createDraftReadyFixture();
+  const ownerId = new Types.ObjectId();
+
+  for (const fixture of [expiredFixture, otherBusinessFixture, mismatchedMarkerFixture, liveFixture]) {
+    assert.equal((await approveAiReplyDraft({
+      businessId: fixture.businessId,
+      userId: ownerId,
+      jobId: fixture.jobId,
+    })).kind, "approved");
+  }
+
+  const expiredReservation = await reserveAiReplyDraftForSending({
+    businessId: expiredFixture.businessId,
+    jobId: expiredFixture.jobId,
+    leaseDurationMs: 120_000,
+  });
+  const otherBusinessReservation = await reserveAiReplyDraftForSending({
+    businessId: otherBusinessFixture.businessId,
+    jobId: otherBusinessFixture.jobId,
+    leaseDurationMs: 120_000,
+  });
+  const mismatchedMarkerReservation = await reserveAiReplyDraftForSending({
+    businessId: mismatchedMarkerFixture.businessId,
+    jobId: mismatchedMarkerFixture.jobId,
+    leaseDurationMs: 120_000,
+  });
+  const liveReservation = await reserveAiReplyDraftForSending({
+    businessId: liveFixture.businessId,
+    jobId: liveFixture.jobId,
+    leaseDurationMs: 120_000,
+  });
+  assert.equal(expiredReservation.kind, "reserved");
+  assert.equal(otherBusinessReservation.kind, "reserved");
+  assert.equal(mismatchedMarkerReservation.kind, "reserved");
+  assert.equal(liveReservation.kind, "reserved");
+
+  const recoveryTime = new Date();
+  const expiredAt = new Date(recoveryTime.getTime() - 1_000);
+  for (const fixture of [expiredFixture, otherBusinessFixture, mismatchedMarkerFixture]) {
+    await AiReplyJob.updateOne(
+      { _id: fixture.jobId, businessId: fixture.businessId, status: "sending" },
+      { $set: { sendLeaseExpiresAt: expiredAt } },
+      { timestamps: false },
+    ).exec();
+  }
+
+  const unrelatedActiveJobId = new Types.ObjectId();
+  await Conversation.updateOne(
+    { _id: mismatchedMarkerFixture.conversationId, businessId: mismatchedMarkerFixture.businessId },
+    { $set: { activeAiSendJobId: unrelatedActiveJobId } },
+    { timestamps: false },
+  ).exec();
+
+  assert.equal(await recoverExpiredAiReplySendReservations(recoveryTime, 100), 2);
+
+  for (const fixture of [expiredFixture, otherBusinessFixture]) {
+    const [job, conversation] = await Promise.all([
+      AiReplyJob.findOne({ _id: fixture.jobId, businessId: fixture.businessId })
+        .select({ status: 1, sendOutcome: 1, sendErrorCode: 1, sendLeaseExpiresAt: 1 })
+        .lean()
+        .exec(),
+      Conversation.findOne({ _id: fixture.conversationId, businessId: fixture.businessId })
+        .select({ activeAiSendJobId: 1 })
+        .lean()
+        .exec(),
+    ]);
+    assert.equal(job?.status, "send_uncertain");
+    assert.equal(job?.sendOutcome, "uncertain");
+    assert.equal(job?.sendErrorCode, "send_lease_expired");
+    assert.equal(job?.sendLeaseExpiresAt, undefined);
+    assert.equal(conversation?.activeAiSendJobId, undefined);
+  }
+
+  const [mismatchedJob, mismatchedConversation] = await Promise.all([
+    AiReplyJob.findOne({ _id: mismatchedMarkerFixture.jobId, businessId: mismatchedMarkerFixture.businessId })
+      .select({ status: 1, sendLeaseExpiresAt: 1 })
+      .lean()
+      .exec(),
+    Conversation.findOne({ _id: mismatchedMarkerFixture.conversationId, businessId: mismatchedMarkerFixture.businessId })
+      .select({ activeAiSendJobId: 1 })
+      .lean()
+      .exec(),
+  ]);
+  assert.equal(mismatchedJob?.status, "sending");
+  assert.ok(mismatchedJob?.sendLeaseExpiresAt <= recoveryTime);
+  assert.equal(mismatchedConversation?.activeAiSendJobId?.toString(), unrelatedActiveJobId.toString());
+
+  const [liveJob, liveConversation] = await Promise.all([
+    AiReplyJob.findOne({ _id: liveFixture.jobId, businessId: liveFixture.businessId })
+      .select({ status: 1, sendLeaseExpiresAt: 1 })
+      .lean()
+      .exec(),
+    Conversation.findOne({ _id: liveFixture.conversationId, businessId: liveFixture.businessId })
+      .select({ activeAiSendJobId: 1 })
+      .lean()
+      .exec(),
+  ]);
+  assert.equal(liveJob?.status, "sending");
+  assert.ok(liveJob?.sendLeaseExpiresAt > recoveryTime);
+  assert.equal(liveConversation?.activeAiSendJobId?.toString(), liveFixture.jobId.toString());
+})
 
 test("real takeover after approval invalidates the approved control version before reservation", async () => {
   const fixture = await createDraftReadyFixture();

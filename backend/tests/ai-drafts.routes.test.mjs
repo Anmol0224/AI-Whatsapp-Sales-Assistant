@@ -64,6 +64,19 @@ function routeHarness(overrides = {}) {
       calls.push({ operation: 'reject', input })
       return overrides.rejectResult ?? { kind: 'rejected' }
     },
+    async sendDraft(input) {
+      calls.push({ operation: 'send', input })
+      return overrides.sendResult ?? {
+        kind: 'sent',
+        draftId: input.draftId.toString(),
+        message: {
+          id: new Types.ObjectId().toString(),
+          text: 'Approved owner-reviewed reply',
+          status: 'sent',
+          createdAt: now.toISOString(),
+        },
+      }
+    },
     async conversationExists(id, ownerBusinessId) {
       calls.push({ operation: 'conversation-exists', ownerBusinessId, id })
       return overrides.conversationExists?.(id, ownerBusinessId) ?? false
@@ -266,6 +279,95 @@ test('rejection success returns a safe terminal summary; stale approval maps to 
     assert.equal(stale.response.status, 409)
     assert.equal(stale.body.code, 'stale')
   })
+})
+
+test('AI draft send requires owner authentication, a valid ID, and an empty JSON body', async () => {
+  await withServer({}, async (baseUrl, calls) => {
+    const unauthenticated = await post(baseUrl, `/ai-drafts/${draftId}/send`, {}, null)
+    assert.equal(unauthenticated.response.status, 401)
+
+    const invalidId = await post(baseUrl, '/ai-drafts/not-an-id/send', {})
+    assert.equal(invalidId.response.status, 400)
+
+    for (const body of [
+      { text: 'attacker-supplied message' },
+      { businessId: otherBusinessId.toString() },
+      { customerId: new Types.ObjectId().toString() },
+      { conversationId: new Types.ObjectId().toString() },
+      { unexpected: true },
+    ]) {
+      const invalidBody = await post(baseUrl, `/ai-drafts/${draftId}/send`, body)
+      assert.equal(invalidBody.response.status, 400)
+    }
+
+    assert.equal(calls.filter((call) => call.operation === 'send').length, 0)
+  })
+})
+
+test('AI draft send derives owner and business scope from JWT and returns a safe sent response', async () => {
+  await withServer({}, async (baseUrl, calls) => {
+    const { response, body } = await post(baseUrl, `/ai-drafts/${draftId}/send`, {})
+    assert.equal(response.status, 200)
+    assert.deepEqual(body, {
+      success: true,
+      message: 'Approved AI draft sent successfully.',
+      draft: { id: draftId.toString(), status: 'sent' },
+      data: {
+        message: {
+          id: body.data.message.id,
+          text: 'Approved owner-reviewed reply',
+          status: 'sent',
+          createdAt: now.toISOString(),
+        },
+      },
+    })
+    assert.deepEqual(calls[0], {
+      operation: 'send',
+      input: { businessId, draftId, ownerUserId: userId },
+    })
+    assert.match(body.data.message.id, /^[a-f\d]{24}$/i)
+    assert.equal(JSON.stringify(body).includes('wamid'), false)
+    assert.equal(JSON.stringify(body).includes('phoneNumber'), false)
+  })
+})
+
+test('AI draft send hides cross-business drafts and maps send outcomes safely', async (context) => {
+  await context.test('cross-business draft is not found', async () => {
+    await withServer({ sendResult: { kind: 'not_found' } }, async (baseUrl, calls) => {
+      const { response, body } = await post(baseUrl, `/ai-drafts/${draftId}/send`, {}, 'Bearer other-owner-test-token')
+      assert.equal(response.status, 404)
+      assert.deepEqual(body, { success: false, message: 'AI draft not found.' })
+      assert.equal(calls[0].input.businessId.toString(), otherBusinessId.toString())
+    })
+  })
+
+  const cases = [
+    ['already sent', { kind: 'already_sent', draftId: draftId.toString() }, 200, 'sent', true],
+    ['in progress', { kind: 'conflict', reason: 'already_sending' }, 409, undefined, false],
+    ['unapproved', { kind: 'conflict', reason: 'not_approved' }, 409, undefined, false],
+    ['stale approval', { kind: 'conflict', reason: 'stale_approval' }, 409, undefined, false],
+    ['Human mode', { kind: 'conflict', reason: 'mode_changed' }, 409, undefined, false],
+    ['definitive failure', { kind: 'send_failed', draftId: draftId.toString(), errorCode: 'provider_rejected' }, 502, 'send_failed', false],
+    ['uncertain outcome', { kind: 'outcome_uncertain', draftId: draftId.toString(), errorCode: 'provider_timeout' }, 202, 'outcome_uncertain', false],
+  ]
+
+  for (const [label, sendResult, status, draftStatus, alreadySent] of cases) {
+    await context.test(label, async () => {
+      await withServer({ sendResult }, async (baseUrl) => {
+        const { response, body } = await post(baseUrl, `/ai-drafts/${draftId}/send`, {})
+        assert.equal(response.status, status)
+        if (draftStatus) assert.equal(body.draft.status, draftStatus)
+        if (alreadySent) assert.equal(body.draft.alreadySent, true)
+        if (label === 'uncertain outcome') {
+          assert.match(body.message, /could not be confirmed/i)
+          assert.match(body.message, /will not be retried automatically/i)
+          assert.equal(JSON.stringify(body).includes('provider_timeout'), false)
+        }
+        assert.equal(JSON.stringify(body).includes('credentials'), false)
+        assert.equal(JSON.stringify(body).includes('phoneNumber'), false)
+      })
+    })
+  }
 })
 
 test('repository applies business and conversation filters, projection, deterministic order and pagination', async () => {

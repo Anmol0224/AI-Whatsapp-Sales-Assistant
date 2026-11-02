@@ -4,11 +4,13 @@ import type { Server } from "node:http";
 import { connectDatabase } from "./config/database.js";
 import { env } from "./config/env.js";
 import { createAiDraftProcessor } from "./services/ai-draft-processor.service.js";
+import { createAiSendRecoveryRuntime } from "./services/ai-send-recovery.runtime.js";
 import { createGeminiService } from "./services/gemini.service.js";
 import { createAiDraftWorkerRuntime } from "./workers/ai-draft.worker.js";
 
 let apiServer: Server | null = null;
 let aiDraftWorker: ReturnType<typeof createAiDraftWorkerRuntime> | null = null;
+const aiSendRecovery = createAiSendRecoveryRuntime();
 let shutdownPromise: Promise<void> | null = null;
 let shuttingDown = false;
 
@@ -57,6 +59,13 @@ async function shutdown(signal: NodeJS.Signals): Promise<void> {
     let shutdownFailed = false;
 
     try {
+      await aiSendRecovery.stop();
+    } catch {
+      shutdownFailed = true;
+      console.error("AI send recovery shutdown failed.");
+    }
+
+    try {
       await aiDraftWorker?.stop();
     } catch {
       shutdownFailed = true;
@@ -95,6 +104,8 @@ async function startServer(): Promise<void> {
   }
 
   if (shuttingDown) return;
+
+  aiSendRecovery.start();
 
   apiServer = app.listen(env.PORT, () => {
     console.log(`WhatsApp Sales Assistant API listening on port ${env.PORT}`);
