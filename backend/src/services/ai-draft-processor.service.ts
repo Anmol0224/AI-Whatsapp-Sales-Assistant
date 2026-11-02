@@ -1,6 +1,6 @@
 import { Types } from "mongoose";
 import { performance } from "node:perf_hooks";
-import { logAiPipelineTiming } from "./ai-pipeline-telemetry.js";
+import { logAiPipelineTiming, type AiPipelineProviderCategory } from "./ai-pipeline-telemetry.js";
 import {
   AI_REPLY_JOB_MAX_ATTEMPTS,
   cancelProcessingAiReplyJob,
@@ -169,6 +169,9 @@ function validateDraft(value: unknown): string | null {
 function categorizeGeminiFailure(error: unknown): {
   retryable: boolean;
   errorCode: "provider_unavailable" | "provider_timeout" | "invalid_output" | "internal_error";
+  providerCategory?: AiPipelineProviderCategory;
+  providerHttpStatus?: number;
+  providerNetworkCode?: string;
 } {
   if (!(error instanceof GeminiServiceError)) {
     return isTransientDatabaseError(error)
@@ -176,23 +179,29 @@ function categorizeGeminiFailure(error: unknown): {
       : { retryable: false, errorCode: "internal_error" };
   }
 
+  const diagnosticFields = {
+    providerCategory: error.diagnostic?.category ?? error.category,
+    ...(error.diagnostic?.httpStatus === undefined ? {} : { providerHttpStatus: error.diagnostic.httpStatus }),
+    ...(error.diagnostic?.networkCode === undefined ? {} : { providerNetworkCode: error.diagnostic.networkCode }),
+  };
+
   switch (error.category) {
     case "timeout":
-      return { retryable: true, errorCode: "provider_timeout" };
+      return { retryable: true, errorCode: "provider_timeout", ...diagnosticFields };
     case "rate_limited":
     case "provider_error":
-      return { retryable: true, errorCode: "provider_unavailable" };
+      return { retryable: true, errorCode: "provider_unavailable", ...diagnosticFields };
     case "empty_response":
     case "invalid_response":
     case "output_too_large":
-      return { retryable: false, errorCode: "invalid_output" };
+      return { retryable: false, errorCode: "invalid_output", ...diagnosticFields };
     case "missing_credentials":
     case "authentication_failed":
     case "permission_denied":
-      return { retryable: false, errorCode: "provider_unavailable" };
+      return { retryable: false, errorCode: "provider_unavailable", ...diagnosticFields };
     case "invalid_request":
     case "input_too_large":
-      return { retryable: false, errorCode: "internal_error" };
+      return { retryable: false, errorCode: "internal_error", ...diagnosticFields };
   }
 }
 
@@ -353,6 +362,10 @@ export function createAiDraftProcessor(options: AiDraftProcessorOptions) {
         stage: "gemini_generation",
         durationMs: performance.now() - generationStartedAt,
         outcome: failure.errorCode,
+        providerCategory: failure.providerCategory,
+        providerHttpStatus: failure.providerHttpStatus,
+        providerNetworkCode: failure.providerNetworkCode,
+        retryable: failure.retryable,
         jobId: jobId.toString(),
         attemptNumber: job.attemptCount,
       });

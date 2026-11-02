@@ -174,6 +174,9 @@ export function AiDraftsPage() {
         : 'AI generated'
   const currentPage = Math.max(1, pagination.page)
   const totalPages = Math.max(1, pagination.totalPages)
+  const autoRefreshEnabled = Boolean(
+    selectedDraft && currentMode === 'ai' && !modeLoading && !modeError && !modeSaving,
+  )
 
   const selectedCustomerLabel = useMemo(() => {
     const customer = selectedContext?.conversation?.customer
@@ -240,7 +243,7 @@ export function AiDraftsPage() {
     let intervalId: number | undefined
 
     async function refreshDraftListInBackground() {
-      if (!active || document.visibilityState === 'hidden' || draftListRequestInFlight.current) return
+      if (!active || !autoRefreshEnabled || document.visibilityState === 'hidden' || draftListRequestInFlight.current) return
       draftListRequestInFlight.current = true
 
       try {
@@ -311,7 +314,7 @@ export function AiDraftsPage() {
 
     function startPolling() {
       stopPolling()
-      if (active && document.visibilityState !== 'hidden') {
+      if (active && autoRefreshEnabled && document.visibilityState !== 'hidden') {
         intervalId = window.setInterval(() => {
           void refreshDraftListInBackground()
         }, 5_000)
@@ -321,10 +324,14 @@ export function AiDraftsPage() {
     function handleVisibilityChange() {
       if (document.visibilityState === 'hidden') {
         stopPolling()
-      } else {
+      } else if (autoRefreshEnabled) {
         void refreshDraftListInBackground()
         startPolling()
       }
+    }
+
+    if (!autoRefreshEnabled) {
+      return () => { active = false }
     }
 
     document.addEventListener('visibilitychange', handleVisibilityChange)
@@ -335,7 +342,7 @@ export function AiDraftsPage() {
       stopPolling()
       document.removeEventListener('visibilitychange', handleVisibilityChange)
     }
-  }, [page, status])
+  }, [autoRefreshEnabled, page, status])
 
   useEffect(() => {
     setDesiredMode(selectedDraft ? responseModes[selectedDraft.conversationId] ?? '' : '')

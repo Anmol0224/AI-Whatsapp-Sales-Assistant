@@ -54,6 +54,21 @@ export type AiPipelineTimingOutcome =
   | "validation_rejected"
   | "retryable_failure";
 
+export type AiPipelineProviderCategory =
+  | "rate_limited"
+  | "authentication_failed"
+  | "permission_denied"
+  | "timeout"
+  | "network_error"
+  | "provider_5xx"
+  | "provider_error"
+  | "missing_credentials"
+  | "invalid_request"
+  | "input_too_large"
+  | "empty_response"
+  | "invalid_response"
+  | "output_too_large";
+
 export interface AiPipelineTimingFields {
   event: AiPipelineTimingEventName;
   stage: AiPipelineTimingStage;
@@ -66,6 +81,10 @@ export interface AiPipelineTimingFields {
   recoveryDurationMs?: number;
   claimDurationMs?: number;
   httpStatus?: number;
+  providerCategory?: AiPipelineProviderCategory;
+  providerHttpStatus?: number;
+  providerNetworkCode?: string;
+  retryable?: boolean;
 }
 
 const eventNames = new Set<AiPipelineTimingEventName>([
@@ -127,6 +146,35 @@ const outcomes = new Set<AiPipelineTimingOutcome>([
   "retryable_failure",
 ]);
 
+const providerCategories = new Set<AiPipelineProviderCategory>([
+  "rate_limited",
+  "authentication_failed",
+  "permission_denied",
+  "timeout",
+  "network_error",
+  "provider_5xx",
+  "provider_error",
+  "missing_credentials",
+  "invalid_request",
+  "input_too_large",
+  "empty_response",
+  "invalid_response",
+  "output_too_large",
+]);
+
+const providerHttpStatuses = new Set([400, 401, 403, 404, 408, 409, 422, 429, 500, 502, 503, 504]);
+const providerNetworkCodes = new Set([
+  "ECONNABORTED",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "EPIPE",
+  "ETIMEDOUT",
+]);
+
 function safeMilliseconds(value: number | undefined): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value >= 0
     ? Math.round(value)
@@ -137,7 +185,7 @@ function safeMilliseconds(value: number | undefined): number | undefined {
 export function logAiPipelineTiming(fields: AiPipelineTimingFields): void {
   if (!eventNames.has(fields.event) || !stages.has(fields.stage) || !outcomes.has(fields.outcome)) return;
 
-  const event: Record<string, string | number> = {
+  const event: Record<string, string | number | boolean> = {
     event: fields.event,
     stage: fields.stage,
     outcome: fields.outcome,
@@ -163,6 +211,16 @@ export function logAiPipelineTiming(fields: AiPipelineTimingFields): void {
   if (Number.isInteger(fields.httpStatus) && fields.httpStatus! >= 100 && fields.httpStatus! <= 599) {
     event.httpStatus = fields.httpStatus!;
   }
+  if (providerCategories.has(fields.providerCategory as AiPipelineProviderCategory)) {
+    event.providerCategory = fields.providerCategory!;
+  }
+  if (Number.isInteger(fields.providerHttpStatus) && providerHttpStatuses.has(fields.providerHttpStatus!)) {
+    event.providerHttpStatus = fields.providerHttpStatus!;
+  }
+  if (typeof fields.providerNetworkCode === "string" && providerNetworkCodes.has(fields.providerNetworkCode)) {
+    event.providerNetworkCode = fields.providerNetworkCode;
+  }
+  if (typeof fields.retryable === "boolean") event.retryable = fields.retryable;
 
   try {
     console.info(JSON.stringify(event));

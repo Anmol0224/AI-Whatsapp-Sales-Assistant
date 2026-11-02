@@ -261,6 +261,88 @@ test('retries a provider rate limit but does not retry permanent authentication 
   })
 })
 
+test('logs safe Gemini diagnostics, retryability and generation duration without provider details', async (context) => {
+  const originalInfo = console.info
+  const lines = []
+  console.info = (line) => lines.push(line)
+
+  try {
+    await context.test('provider 504 is categorized and retryable', async () => {
+      const { repository } = makeFakeRepository()
+      const processor = makeProcessor({
+        repository,
+        generator: {
+          async generateText() {
+            throw new GeminiServiceError('provider_error', {
+              category: 'provider_5xx',
+              httpStatus: 504,
+            })
+          },
+        },
+      })
+
+      assert.equal((await processor.processNext()).kind, 'retry_scheduled')
+      const event = lines.map((line) => JSON.parse(line)).find((entry) => entry.event === 'ai_pipeline.gemini_request')
+      assert.equal(event.outcome, 'provider_unavailable')
+      assert.equal(event.providerCategory, 'provider_5xx')
+      assert.equal(event.providerHttpStatus, 504)
+      assert.equal(event.retryable, true)
+      assert.equal(Number.isFinite(event.durationMs), true)
+    })
+
+    lines.length = 0
+    await context.test('network failure retains only allowlisted code and is retryable', async () => {
+      const { repository } = makeFakeRepository()
+      const processor = makeProcessor({
+        repository,
+        generator: {
+          async generateText() {
+            throw new GeminiServiceError('provider_error', {
+              category: 'network_error',
+              networkCode: 'ECONNRESET',
+            })
+          },
+        },
+      })
+
+      assert.equal((await processor.processNext()).kind, 'retry_scheduled')
+      const event = lines.map((line) => JSON.parse(line)).find((entry) => entry.event === 'ai_pipeline.gemini_request')
+      assert.equal(event.providerCategory, 'network_error')
+      assert.equal(event.providerNetworkCode, 'ECONNRESET')
+      assert.equal(event.retryable, true)
+    })
+
+    lines.length = 0
+    await context.test('authentication failure is safely categorized as non-retryable', async () => {
+      const { repository } = makeFakeRepository()
+      const processor = makeProcessor({
+        repository,
+        generator: {
+          async generateText() {
+            throw new GeminiServiceError('authentication_failed', {
+              category: 'authentication_failed',
+              httpStatus: 401,
+            })
+          },
+        },
+      })
+
+      assert.deepEqual(await processor.processNext(), { kind: 'failed', errorCode: 'provider_unavailable' })
+      const event = lines.map((line) => JSON.parse(line)).find((entry) => entry.event === 'ai_pipeline.gemini_request')
+      assert.equal(event.providerCategory, 'authentication_failed')
+      assert.equal(event.providerHttpStatus, 401)
+      assert.equal(event.retryable, false)
+    })
+  } finally {
+    console.info = originalInfo
+  }
+
+  const serialized = lines.join('\n')
+  for (const privateValue of ['private provider detail', 'prompt', 'Authorization', 'api-key']) {
+    assert.equal(serialized.includes(privateValue), false)
+  }
+})
+
 test('rejects empty, malformed, control-character, and over-limit model output without retry', async (context) => {
   for (const invalidText of ['', '   ', null, `x`.repeat(4_097), 'unsafe\u0000text']) {
     await context.test(String(invalidText).slice(0, 24), async () => {
