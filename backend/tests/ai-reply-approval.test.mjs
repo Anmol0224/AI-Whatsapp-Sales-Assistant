@@ -38,6 +38,10 @@ function matches(document, filter) {
         if (!(document[key] instanceof Date) || document[key] > expected.$lte) return false
       } else if ('$gt' in expected) {
         if (!(document[key] instanceof Date) || document[key] <= expected.$gt) return false
+      } else if ('$in' in expected) {
+        if (!expected.$in.some((value) => value?.toString() === document[key]?.toString())) return false
+      } else if ('$ne' in expected) {
+        if (document[key]?.toString() === expected.$ne?.toString()) return false
       } else if (document[key]?.toString() !== expected.toString()) return false
     } else if (document[key]?.toString() !== expected?.toString()) return false
   }
@@ -178,6 +182,22 @@ test('approval requires AI mode and business-scoped job ownership', async () => 
   })
 })
 
+test('canonical ai_draft mode supports existing approval and takeover fencing', async () => {
+  await withRepositoryMocks(async (state) => {
+    state.conversation.responseMode = 'ai_draft'
+    const approved = await approveAiReplyDraft({ businessId, userId, jobId, now })
+    assert.equal(approved.kind, 'approved')
+    assert.equal(state.job.status, 'approved')
+  })
+
+  await withRepositoryMocks(async (state) => {
+    state.conversation.responseMode = 'ai_automatic'
+    assert.deepEqual(await takeOverConversation(businessId, conversationId), { kind: 'taken_over' })
+    assert.equal(state.conversation.responseMode, 'human')
+    assert.equal(state.conversation.aiControlVersion, 4)
+  })
+})
+
 test('approval rejects a source inbound message that is no longer current', async () => {
   await withRepositoryMocks(async (state) => {
     state.latestInboundMessageId = new Types.ObjectId()
@@ -250,6 +270,16 @@ test('resuming AI mode increments the fence and leaves older drafts stale', asyn
     })
     assert.equal(state.conversation.aiControlVersion, 5)
     assert.deepEqual(await approveAiReplyDraft({ businessId, userId, jobId, now }), { kind: 'stale' })
+  })
+})
+
+test('switching to ai_draft increments the shared fence and returns the canonical mode', async () => {
+  await withRepositoryMocks(async (state) => {
+    state.conversation.responseMode = 'human'
+    const result = await setConversationResponseMode(businessId, conversationId, 'ai_draft')
+    assert.deepEqual(result, { kind: 'updated', responseMode: 'ai_draft' })
+    assert.equal(state.conversation.responseMode, 'ai_draft')
+    assert.equal(state.conversation.aiControlVersion, 4)
   })
 })
 

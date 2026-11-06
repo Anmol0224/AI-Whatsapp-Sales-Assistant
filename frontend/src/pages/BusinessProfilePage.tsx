@@ -1,12 +1,16 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import {
   ApiError,
+  getBusinessAiSettings,
   getBusinessProfile,
   getBusinessWhatsAppSettings,
+  updateBusinessAiSettings,
   updateBusinessProfile,
   updateBusinessWhatsAppSettings,
+  verifyBusinessWhatsAppSettings,
   type BusinessProfile,
   type BusinessProfileUpdate,
+  type BusinessAiSettingsResponse,
   type BusinessWhatsAppSettings,
 } from '../services/api'
 
@@ -169,10 +173,19 @@ export function BusinessProfilePage() {
   const [whatsappLoadAttempt, setWhatsappLoadAttempt] = useState(0)
   const [whatsappSaving, setWhatsappSaving] = useState(false)
   const whatsappSavingRef = useRef(false)
+  const [whatsappVerifying, setWhatsappVerifying] = useState(false)
+  const whatsappVerifyingRef = useRef(false)
   const [whatsappError, setWhatsappError] = useState<string | null>(null)
   const [whatsappSuccess, setWhatsappSuccess] = useState<string | null>(null)
   const [whatsappPhoneNumberIdError, setWhatsappPhoneNumberIdError] = useState<string | null>(null)
   const [whatsappDisplayNumberError, setWhatsappDisplayNumberError] = useState<string | null>(null)
+  const [businessAiSettings, setBusinessAiSettings] = useState<BusinessAiSettingsResponse | null>(null)
+  const [businessAiSettingsLoading, setBusinessAiSettingsLoading] = useState(true)
+  const [businessAiSettingsError, setBusinessAiSettingsError] = useState<string | null>(null)
+  const [businessAiSettingsRetry, setBusinessAiSettingsRetry] = useState(0)
+  const [businessAiSettingsSaving, setBusinessAiSettingsSaving] = useState(false)
+  const businessAiSettingsSavingRef = useRef(false)
+  const [businessAiSettingsSuccess, setBusinessAiSettingsSuccess] = useState<string | null>(null)
 
   useEffect(() => {
     let isCurrent = true
@@ -232,6 +245,32 @@ export function BusinessProfilePage() {
       isCurrent = false
     }
   }, [whatsappLoadAttempt])
+
+  useEffect(() => {
+    let isCurrent = true
+    setBusinessAiSettingsLoading(true)
+    setBusinessAiSettingsError(null)
+
+    void getBusinessAiSettings()
+      .then((result) => {
+        if (isCurrent) setBusinessAiSettings(result)
+      })
+      .catch((error: unknown) => {
+        if (!isCurrent) return
+        setBusinessAiSettingsError(
+          error instanceof ApiError
+            ? error.message
+            : 'Unable to load automatic-reply settings. Please retry.',
+        )
+      })
+      .finally(() => {
+        if (isCurrent) setBusinessAiSettingsLoading(false)
+      })
+
+    return () => {
+      isCurrent = false
+    }
+  }, [businessAiSettingsRetry])
 
   function updateField(field: ProfileField, value: string) {
     setForm((current) => ({ ...current, [field]: value }))
@@ -307,7 +346,7 @@ export function BusinessProfilePage() {
       setWhatsappSettings(result.whatsapp)
       setWhatsappPhoneNumberId(result.whatsapp.phoneNumberId ?? '')
       setWhatsappDisplayNumber(result.whatsapp.displayNumber ?? '')
-      setWhatsappSuccess('WhatsApp number settings saved. Meta connectivity has not been verified.')
+      setWhatsappSuccess('WhatsApp number settings saved. Verify the saved configuration separately.')
     } catch (error) {
       setWhatsappError(
         error instanceof ApiError
@@ -320,7 +359,95 @@ export function BusinessProfilePage() {
     }
   }
 
+  async function handleWhatsAppVerify() {
+    if (whatsappVerifyingRef.current || whatsappSavingRef.current || !whatsappSettings?.phoneNumberId) return
+    whatsappVerifyingRef.current = true
+    setWhatsappVerifying(true)
+    setWhatsappError(null)
+    setWhatsappSuccess(null)
+    setWhatsappSettings((current) => current ? {
+      ...current,
+      connectionStatus: 'verification_pending',
+      verifiedPhoneNumberId: undefined,
+      lastVerificationAt: undefined,
+      verificationFailureCategory: undefined,
+      verifiedDisplayNumber: undefined,
+      verifiedName: undefined,
+      qualityRating: undefined,
+    } : current)
+
+    try {
+      const result = await verifyBusinessWhatsAppSettings()
+      setWhatsappSettings(result.whatsapp)
+      setWhatsappSuccess(result.message)
+    } catch (error) {
+      if (error instanceof ApiError && [422, 502, 504].includes(error.status ?? 0)) {
+        setWhatsappSettings((current) => current ? { ...current, connectionStatus: 'verification_failed' } : current)
+      } else {
+        setWhatsappSettings((current) => current ? { ...current, connectionStatus: 'configured_not_verified' } : current)
+      }
+      setWhatsappError(
+        error instanceof ApiError
+          ? error.message
+          : 'Unable to verify the WhatsApp configuration. Please try again.',
+      )
+    } finally {
+      whatsappVerifyingRef.current = false
+      setWhatsappVerifying(false)
+    }
+  }
+
+  async function handleAutomaticRepliesChange(enabled: boolean) {
+    const current = businessAiSettings
+    if (!current || businessAiSettingsSavingRef.current) return
+    if (enabled && !current.automaticSendAvailable) return
+    if (enabled && !window.confirm(
+      'Enable automatic replies for this business? Eligible AI Automatic conversations may send messages to customers without per-message owner approval. Unsupported questions will be escalated for review, and you can switch a conversation to Human mode at any time.',
+    )) return
+
+    businessAiSettingsSavingRef.current = true
+    setBusinessAiSettingsSaving(true)
+    setBusinessAiSettingsError(null)
+    setBusinessAiSettingsSuccess(null)
+    try {
+      const saved = await updateBusinessAiSettings({ automaticRepliesEnabled: enabled })
+      setBusinessAiSettings(saved)
+      setBusinessAiSettingsSuccess(enabled
+        ? 'Automatic-reply opt-in saved. Choose AI Automatic per conversation to make it eligible.'
+        : 'Automatic-reply opt-in disabled for this business.')
+      try {
+        const refreshed = await getBusinessAiSettings()
+        setBusinessAiSettings(refreshed)
+      } catch {
+        setBusinessAiSettingsError('Your setting was saved, but its latest status could not be refreshed. Retry to confirm current availability.')
+      }
+    } catch (error) {
+      setBusinessAiSettingsError(
+        error instanceof ApiError
+          ? error.message
+          : 'Unable to update automatic-reply settings. Please try again.',
+      )
+    } finally {
+      businessAiSettingsSavingRef.current = false
+      setBusinessAiSettingsSaving(false)
+    }
+  }
+
   const isDirty = (Object.keys(form) as ProfileField[]).some((field) => form[field] !== savedForm[field])
+  const savedPhoneNumberId = whatsappSettings?.phoneNumberId ?? ''
+  const whatsappNumberChanged = whatsappPhoneNumberId.trim() !== savedPhoneNumberId
+  const displayedWhatsAppStatus = !whatsappPhoneNumberId.trim()
+    ? 'not_configured'
+    : whatsappNumberChanged
+      ? 'configured_not_verified'
+      : whatsappSettings?.connectionStatus ?? 'configured_not_verified'
+  const hasCurrentVerification = displayedWhatsAppStatus === 'verified' &&
+    whatsappSettings?.verifiedPhoneNumberId === savedPhoneNumberId &&
+    !whatsappNumberChanged
+  const automaticRepliesSettings = businessAiSettings?.aiSettings
+  const automaticRepliesLastChangedAt = automaticRepliesSettings?.automaticRepliesEnabled
+    ? automaticRepliesSettings.automaticRepliesEnabledAt ?? automaticRepliesSettings.automaticRepliesDisabledAt
+    : automaticRepliesSettings?.automaticRepliesDisabledAt ?? automaticRepliesSettings?.automaticRepliesEnabledAt
 
   if (loading) {
     return (
@@ -501,15 +628,21 @@ export function BusinessProfilePage() {
             </p>
           </div>
           <span className={`w-fit rounded-full px-3 py-1 text-xs font-semibold ${
-            whatsappSettings?.connectionStatus === 'configured_not_verified'
-              ? 'bg-amber-50 text-amber-800'
-              : 'bg-slate-100 text-slate-600'
+            displayedWhatsAppStatus === 'verified'
+              ? 'bg-emerald-50 text-emerald-800'
+              : displayedWhatsAppStatus === 'verification_failed'
+                ? 'bg-rose-50 text-rose-800'
+                : displayedWhatsAppStatus === 'verification_pending'
+                  ? 'bg-sky-50 text-sky-800'
+                  : displayedWhatsAppStatus === 'configured_not_verified'
+                    ? 'bg-amber-50 text-amber-800'
+                    : 'bg-slate-100 text-slate-600'
           }`}>
-            {whatsappLoading
-              ? 'Loading status…'
-              : whatsappSettings?.connectionStatus === 'configured_not_verified'
-                ? 'Configured — not verified'
-                : 'Not configured'}
+            {whatsappLoading ? 'Loading status…' :
+              displayedWhatsAppStatus === 'verified' ? 'Verified' :
+                displayedWhatsAppStatus === 'verification_failed' ? 'Verification failed' :
+                  displayedWhatsAppStatus === 'verification_pending' ? 'Verifying…' :
+                    displayedWhatsAppStatus === 'configured_not_verified' ? 'Configured — not verified' : 'Not configured'}
           </span>
         </div>
 
@@ -587,20 +720,148 @@ export function BusinessProfilePage() {
             {whatsappError && <div role="alert" aria-live="polite" className="rounded-xl bg-rose-50 px-4 py-3 text-sm text-rose-800">{whatsappError}</div>}
             {whatsappSuccess && <div role="status" aria-live="polite" className="rounded-xl bg-emerald-50 px-4 py-3 text-sm text-emerald-800">{whatsappSuccess}</div>}
 
+            {hasCurrentVerification && whatsappSettings && (
+              <div className="rounded-xl border border-emerald-100 bg-emerald-50/60 px-4 py-3 text-sm text-emerald-950">
+                <p className="font-medium">Meta confirmed this Phone Number ID.</p>
+                {whatsappSettings.verifiedDisplayNumber && <p className="mt-1">Verified number: {whatsappSettings.verifiedDisplayNumber}</p>}
+                {whatsappSettings.verifiedName && <p className="mt-1">Verified name: {whatsappSettings.verifiedName}</p>}
+                {whatsappSettings.qualityRating && <p className="mt-1">Quality rating: {whatsappSettings.qualityRating}</p>}
+              </div>
+            )}
+            {displayedWhatsAppStatus === 'verification_failed' && whatsappSettings?.verificationFailureCategory && (
+              <p className="text-sm text-rose-800">Verification issue: {whatsappSettings.verificationFailureCategory.replaceAll('_', ' ')}.</p>
+            )}
+            {whatsappSettings?.lastVerificationAt && (
+              <p className="text-xs text-slate-600">Last verification attempt: {new Date(whatsappSettings.lastVerificationAt).toLocaleString()}.</p>
+            )}
+
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <p className="max-w-2xl text-xs leading-5 text-slate-500">
-                Saving this ID records configuration only. It does not verify Meta connectivity or send a message.
+                Saving settings does not verify Meta access. Verification checks number metadata only and never sends a message. Save the current Phone Number ID before verifying. A verified status reflects the last check; token or permission changes require another verification.
               </p>
-              <button
-                type="submit"
-                disabled={whatsappSaving || !whatsappPhoneNumberId.trim()}
-                className="shrink-0 rounded-xl bg-emerald-700 px-5 py-3 text-sm font-semibold text-white outline-none transition hover:bg-emerald-800 focus-visible:ring-2 focus-visible:ring-emerald-600 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {whatsappSaving ? 'Saving…' : 'Save WhatsApp settings'}
-              </button>
+              <div className="flex flex-col gap-3 sm:flex-row">
+                <button
+                  type="button"
+                  onClick={() => void handleWhatsAppVerify()}
+                  disabled={whatsappVerifying || whatsappSaving || whatsappLoading || !savedPhoneNumberId || whatsappNumberChanged}
+                  className="shrink-0 rounded-xl border border-emerald-700 bg-white px-5 py-3 text-sm font-semibold text-emerald-800 outline-none transition hover:bg-emerald-50 focus-visible:ring-2 focus-visible:ring-emerald-600 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {whatsappVerifying ? 'Verifying…' : 'Verify connection'}
+                </button>
+                <button
+                  type="submit"
+                  disabled={whatsappSaving || !whatsappPhoneNumberId.trim()}
+                  className="shrink-0 rounded-xl bg-emerald-700 px-5 py-3 text-sm font-semibold text-white outline-none transition hover:bg-emerald-800 focus-visible:ring-2 focus-visible:ring-emerald-600 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {whatsappSaving ? 'Saving…' : 'Save WhatsApp settings'}
+                </button>
+              </div>
             </div>
           </form>
         )}
+      </section>
+
+      <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm sm:p-7" aria-labelledby="automatic-replies-heading">
+        <div className="mb-6 flex flex-col gap-3 border-b border-slate-100 pb-4 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <h3 id="automatic-replies-heading" className="font-semibold text-slate-950">Automatic replies</h3>
+            <p className="mt-1 max-w-2xl text-sm leading-6 text-slate-500">
+              Business opt-in is separate from choosing AI Automatic for an individual conversation.
+            </p>
+          </div>
+          <span className={`w-fit rounded-full px-3 py-1 text-xs font-semibold ${
+            businessAiSettingsLoading
+              ? 'bg-slate-100 text-slate-600'
+              : businessAiSettings?.automaticSendAvailable
+                ? 'bg-emerald-50 text-emerald-800'
+                : 'bg-amber-50 text-amber-900'
+          }`}>
+            {businessAiSettingsLoading
+              ? 'Checking platform…'
+              : businessAiSettings?.automaticSendAvailable
+                ? 'Platform available'
+                : 'Platform unavailable'}
+          </span>
+        </div>
+
+        {businessAiSettingsLoading ? (
+          <div role="status" aria-live="polite" className="py-3 text-sm text-slate-600">Loading automatic-reply settings…</div>
+        ) : businessAiSettingsError && !businessAiSettings ? (
+          <div role="alert" className="rounded-xl border border-rose-200 bg-rose-50 p-4">
+            <p className="text-sm text-rose-800">{businessAiSettingsError}</p>
+            <button type="button" onClick={() => setBusinessAiSettingsRetry((attempt) => attempt + 1)} className="mt-3 rounded-lg bg-white px-3.5 py-2 text-sm font-semibold text-rose-800 outline-none hover:bg-rose-100 focus-visible:ring-2 focus-visible:ring-rose-600">
+              Retry loading
+            </button>
+          </div>
+        ) : businessAiSettings ? (
+          <div className="space-y-5">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Platform authorization</p>
+                <p className="mt-1 text-sm font-semibold text-slate-900">
+                  {businessAiSettings.automaticSendAvailable ? 'Available' : 'Unavailable'}
+                </p>
+                <p className="mt-1 text-xs leading-5 text-slate-600">
+                  {businessAiSettings.automaticSendAvailable
+                    ? 'The application currently permits eligible automatic replies.'
+                    : 'The application-level automatic-send gate is off. Enabling business opt-in cannot make automatic sending available.'}
+                </p>
+              </div>
+              <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Business owner opt-in</p>
+                <p className="mt-1 text-sm font-semibold text-slate-900">
+                  {businessAiSettings.aiSettings.automaticRepliesEnabled ? 'Enabled' : 'Disabled'}
+                </p>
+                <p className="mt-1 text-xs leading-5 text-slate-600">
+                  This records your workspace consent. A conversation must also be set to AI Automatic before it is eligible.
+                </p>
+              </div>
+            </div>
+
+            {!businessAiSettings.automaticSendAvailable && (
+              <p className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-5 text-amber-950" role="status">
+                Automatic replies are unavailable because the platform gate is off. You can still disable an existing business opt-in.
+              </p>
+            )}
+
+            <div className="flex flex-col gap-4 rounded-xl border border-slate-200 p-4 sm:flex-row sm:items-center sm:justify-between">
+              <div className="max-w-2xl">
+                <label htmlFor="automatic-replies-opt-in" className="text-sm font-semibold text-slate-900">Allow automatic replies for this business</label>
+                <p className="mt-1 text-xs leading-5 text-slate-600">
+                  Eligible AI Automatic conversations may send without per-message approval. Unsupported questions are escalated, and Human mode remains available for immediate takeover.
+                </p>
+                <p className="mt-2 text-xs text-slate-500">
+                  Safety policy: {automaticRepliesSettings?.automaticRepliesPolicyVersion ? 'configured' : 'not reported'}.
+                  {' '}Last opt-in change: {automaticRepliesLastChangedAt
+                    ? new Date(automaticRepliesLastChangedAt).toLocaleString()
+                    : 'not recorded'}.
+                </p>
+              </div>
+              <div className="flex shrink-0 items-center gap-3">
+                <span className="text-xs font-medium text-slate-600">{businessAiSettings.aiSettings.automaticRepliesEnabled ? 'Enabled' : 'Disabled'}</span>
+                <input
+                  id="automatic-replies-opt-in"
+                  type="checkbox"
+                  checked={businessAiSettings.aiSettings.automaticRepliesEnabled}
+                  onChange={(event) => void handleAutomaticRepliesChange(event.target.checked)}
+                  disabled={businessAiSettingsSaving || (businessAiSettings.automaticSendAvailable === false && !businessAiSettings.aiSettings.automaticRepliesEnabled)}
+                  aria-describedby="automatic-replies-opt-in-hint"
+                  className="h-5 w-5 accent-emerald-700 disabled:cursor-not-allowed"
+                />
+                <span id="automatic-replies-opt-in-hint" className="sr-only">Enabling requires confirmation and platform availability.</span>
+              </div>
+            </div>
+
+            {businessAiSettingsError && <div role="alert" aria-live="polite" className="rounded-xl bg-rose-50 px-4 py-3 text-sm text-rose-800">{businessAiSettingsError}</div>}
+            {businessAiSettingsSuccess && <div role="status" aria-live="polite" className="rounded-xl bg-emerald-50 px-4 py-3 text-sm text-emerald-800">{businessAiSettingsSuccess}</div>}
+            {businessAiSettingsError && (
+              <button type="button" onClick={() => setBusinessAiSettingsRetry((attempt) => attempt + 1)} disabled={businessAiSettingsLoading || businessAiSettingsSaving} className="rounded-lg border border-slate-200 px-3.5 py-2 text-sm font-semibold text-slate-700 outline-none hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-emerald-600 disabled:opacity-50">
+                Refresh settings
+              </button>
+            )}
+            {businessAiSettingsSaving && <p role="status" className="text-sm text-slate-600">Saving owner opt-in…</p>}
+          </div>
+        ) : null}
       </section>
     </div>
   )

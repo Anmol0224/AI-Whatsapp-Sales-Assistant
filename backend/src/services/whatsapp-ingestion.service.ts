@@ -8,7 +8,10 @@ import { Customer, type CustomerFields } from "../models/customer.model.js";
 import { Message, type MessageFields } from "../models/message.model.js";
 import { logAiPipelineTiming } from "./ai-pipeline-telemetry.js";
 import { wakeAiDraftWorker } from "./ai-draft-worker-wake.js";
-import { createAiReplyJobInSession } from "./ai-reply-job.repository.js";
+import {
+  createAiReplyJobInSession,
+  createAutomaticAiReplyJobInSession,
+} from "./ai-reply-job.repository.js";
 
 const phoneNumberSchema = z
   .string()
@@ -116,6 +119,7 @@ export interface WhatsAppIngestionRepository {
     businessId: string,
     message: IncomingWhatsAppTextMessage,
     aiDraftWorkerEnabled: boolean,
+    aiAutomaticSendEnabled?: boolean,
   ): Promise<"inserted" | "duplicate" | "unmapped">;
   updateOutgoingMessageStatus(
     businessId: string,
@@ -250,8 +254,10 @@ async function persistIncomingTextMessage(
   businessId: string,
   incoming: IncomingWhatsAppTextMessage,
   aiDraftWorkerEnabled: boolean,
+  aiAutomaticSendEnabled = env.AI_AUTOMATIC_SEND_ENABLED,
 ): Promise<"inserted" | "duplicate" | "unmapped"> {
-  if (!incoming.phoneNumberId) return "unmapped";
+  const phoneNumberId = incoming.phoneNumberId;
+  if (!phoneNumberId) return "unmapped";
 
   const businessObjectId = new Types.ObjectId(businessId);
   const duplicateFilter = { businessId: businessObjectId, providerMessageId: incoming.providerMessageId };
@@ -259,7 +265,10 @@ async function persistIncomingTextMessage(
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const session = await mongoose.startSession();
     let result: "inserted" | "duplicate" | "unmapped" | undefined;
-    let aiJobCreation: Awaited<ReturnType<typeof createAiReplyJobInSession>> | undefined;
+    let aiJobCreation:
+      | Awaited<ReturnType<typeof createAiReplyJobInSession>>
+      | Awaited<ReturnType<typeof createAutomaticAiReplyJobInSession>>
+      | undefined;
     const transactionStartedAt = performance.now();
 
     try {
@@ -268,9 +277,13 @@ async function persistIncomingTextMessage(
         aiJobCreation = undefined;
         const business = await Business.findOne({
           _id: businessObjectId,
-          "whatsapp.phoneNumberId": incoming.phoneNumberId,
+          "whatsapp.phoneNumberId": phoneNumberId,
         })
-          .select({ _id: 1 })
+          .select({
+            _id: 1,
+            "aiSettings.automaticRepliesEnabled": 1,
+            "aiSettings.automaticRepliesPolicyVersion": 1,
+          })
           .session(session)
           .lean();
 
@@ -359,11 +372,24 @@ async function persistIncomingTextMessage(
           throw new Error("Conversation changed during message persistence.");
         }
 
-        if (aiDraftWorkerEnabled && conversation.responseMode === "ai") {
+        if (aiDraftWorkerEnabled && (conversation.responseMode === "ai" || conversation.responseMode === "ai_draft")) {
           aiJobCreation = await createAiReplyJobInSession({
             businessId: businessObjectId,
             conversationId: conversation._id,
             inboundMessageId: createdMessage._id,
+            session,
+          });
+        } else if (aiAutomaticSendEnabled && conversation.responseMode === "ai_automatic") {
+          const currentControlVersion = Number.isSafeInteger(conversation.aiControlVersion)
+            ? conversation.aiControlVersion
+            : 0;
+          aiJobCreation = await createAutomaticAiReplyJobInSession({
+            businessId: businessObjectId,
+            phoneNumberId,
+            conversationId: conversation._id,
+            inboundMessageId: createdMessage._id,
+            expectedControlVersion: currentControlVersion + 1,
+            globalGateEnabled: aiAutomaticSendEnabled,
             session,
           });
         }
@@ -503,7 +529,7 @@ const mongooseRepository: WhatsAppIngestionRepository = {
 export async function ingestWhatsAppPayload(
   payload: unknown,
   repository: WhatsAppIngestionRepository = mongooseRepository,
-  options: { aiDraftWorkerEnabled?: boolean } = {},
+  options: { aiDraftWorkerEnabled?: boolean; aiAutomaticSendEnabled?: boolean } = {},
 ): Promise<IngestionResult> {
   const ingestionStartedAt = performance.now();
   let outcome: "accepted" | "ignored" | "malformed" | "error" = "error";
@@ -532,6 +558,7 @@ export async function ingestWhatsAppPayload(
         businessId,
         message,
         options.aiDraftWorkerEnabled ?? env.AI_DRAFT_WORKER_ENABLED,
+        options.aiAutomaticSendEnabled ?? env.AI_AUTOMATIC_SEND_ENABLED,
       );
       if (persistenceResult === "inserted") inserted += 1;
       else if (persistenceResult === "duplicate") duplicates += 1;

@@ -1,13 +1,15 @@
 import mongoose, { type HydratedDocument, type Model, type Types } from "mongoose";
 
 export type ConversationStatus = "open" | "closed";
-export type ConversationResponseMode = "human" | "ai";
+export type ConversationResponseMode = "human" | "ai_draft" | "ai_automatic";
+/** Transitional stored value: legacy `ai` remains draft-only until the coordinated migration. */
+export type LegacyConversationResponseMode = "ai";
 
 export interface ConversationFields {
   businessId: Types.ObjectId;
   customerId: Types.ObjectId;
   status: ConversationStatus;
-  responseMode: ConversationResponseMode;
+  responseMode: ConversationResponseMode | LegacyConversationResponseMode;
   aiControlVersion: number;
   activeAiSendJobId?: Types.ObjectId;
   lastMessageAt?: Date;
@@ -36,7 +38,7 @@ const conversationSchema = new mongoose.Schema<ConversationFields>(
     },
     responseMode: {
       type: String,
-      enum: ["human", "ai"],
+      enum: ["human", "ai", "ai_draft", "ai_automatic"],
       default: "human",
       required: true,
     },

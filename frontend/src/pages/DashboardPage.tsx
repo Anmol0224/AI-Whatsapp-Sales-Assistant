@@ -2,6 +2,12 @@ import { useAuth } from '../context/AuthContext'
 
 const managementLinks = [
   {
+    title: 'Escalations',
+    description: 'Inspect automatic reply escalations and record owner resolution decisions.',
+    href: '/dashboard/escalations',
+    marker: 'ES',
+  },
+  {
     title: 'Business profile',
     description: 'Review and update your business information.',
     href: '/dashboard/business',

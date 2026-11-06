@@ -92,7 +92,7 @@ function makeFakeRepository(overrides = {}) {
       return { status: state.status }
     },
     async saveDraft(_business, _conversation, _job, attemptCount, draft) {
-      if (state.mode !== 'ai') return { kind: 'mode_changed' }
+      if (state.mode !== 'ai' && state.mode !== 'ai_draft') return { kind: 'mode_changed' }
       if (state.status !== 'processing' || state.attemptCount !== attemptCount || state.leaseExpiresAt <= now) return { kind: 'stale' }
       state.status = 'draft_ready'
       state.generatedDraft = draft
@@ -130,6 +130,42 @@ test('processes an AI-mode job and persists only the bounded owner-review draft'
   assert.equal(state.generatedDraft, 'Here is a suggested reply.')
   assert.equal(calls.saved, 1)
   assert.equal(state.modeReads, 2)
+})
+
+test('ai_draft mode uses the existing owner-review generation path', async () => {
+  const { repository, state } = makeFakeRepository({ state: { mode: 'ai_draft' } })
+  let generated = 0
+  const processor = makeProcessor({
+    repository,
+    generator: { async generateText() { generated += 1; return { text: 'Draft for owner review' } } },
+  })
+
+  assert.deepEqual(await processor.processNext(), { kind: 'draft_ready' })
+  assert.equal(generated, 1)
+  assert.equal(state.status, 'draft_ready')
+  assert.equal(state.generatedDraft, 'Draft for owner review')
+})
+
+test('claimed ai_automatic workflow is dispatched to the automatic processor, never the draft path', async () => {
+  const { repository, calls } = makeFakeRepository()
+  repository.claimNext = async () => ({
+    _id: jobId, businessId, conversationId, inboundMessageId, attemptCount: 1,
+    workflow: 'ai_automatic', status: 'processing',
+  })
+  let automaticCalls = 0
+  let generatorCalls = 0
+  const processor = createAiDraftProcessor({
+    repository,
+    contextService: { async retrieve() { assert.fail('automatic workflow must use its own pipeline') } },
+    promptBuilder() { assert.fail('automatic workflow must not fall through to the draft prompt path') },
+    generator: { async generateText() { generatorCalls += 1; return { text: 'No' } } },
+    automaticProcessor: { async process(job) { automaticCalls += 1; assert.equal(job.workflow, 'ai_automatic'); return { kind: 'sent' } } },
+    now: () => now,
+  })
+  assert.deepEqual(await processor.processNext(), { kind: 'sent' })
+  assert.equal(automaticCalls, 1)
+  assert.equal(generatorCalls, 0)
+  assert.equal(calls.saved, 0)
 })
 
 test('human mode cancels a claimed job without generating', async () => {

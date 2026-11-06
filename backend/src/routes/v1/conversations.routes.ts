@@ -2,6 +2,7 @@ import { Router, type RequestHandler } from "express";
 import { Types } from "mongoose";
 import { z } from "zod";
 import { authenticate } from "../../middleware/auth.middleware.js";
+import { env } from "../../config/env.js";
 import { Business, type BusinessDocument } from "../../models/business.model.js";
 import { Conversation, type ConversationStatus } from "../../models/conversation.model.js";
 import { Customer } from "../../models/customer.model.js";
@@ -27,7 +28,7 @@ const sendMessageBodySchema = z
   .object({ text: z.string().trim().min(1).max(4096) })
   .strict();
 const responseModeBodySchema = z
-  .object({ responseMode: z.enum(["human", "ai"]) })
+  .object({ responseMode: z.enum(["human", "ai", "ai_draft", "ai_automatic"]) })
   .strict();
 
 interface ConversationRecord {
@@ -93,11 +94,13 @@ export interface ConversationsRouteDependencies {
   getResponseMode(
     conversationId: Types.ObjectId,
     businessId: Types.ObjectId,
-  ): Promise<{ responseMode?: "human" | "ai" } | null>;
+  ): Promise<{ responseMode?: "human" | "ai" | "ai_draft" | "ai_automatic" } | null>;
+  automaticRepliesEnabled(businessId: Types.ObjectId, ownerUserId: Types.ObjectId): Promise<boolean>;
+  isAutomaticSendEnabled(): boolean;
   changeResponseMode(
     businessId: Types.ObjectId,
     conversationId: Types.ObjectId,
-    responseMode: "human" | "ai",
+    responseMode: "human" | "ai" | "ai_draft" | "ai_automatic",
   ): ReturnType<typeof setConversationResponseMode>;
 }
 
@@ -210,8 +213,15 @@ const mongooseDependencies: ConversationsRouteDependencies = {
   getResponseMode: async (conversationId, businessId) =>
     Conversation.findOne({ _id: conversationId, businessId })
       .select({ _id: 1, responseMode: 1 })
-      .lean<{ responseMode?: "human" | "ai" }>()
+      .lean<{ responseMode?: "human" | "ai" | "ai_draft" | "ai_automatic" }>()
       .exec(),
+  automaticRepliesEnabled: async (businessId, ownerUserId) =>
+    Boolean(await Business.exists({
+      _id: businessId,
+      ownerUserId,
+      "aiSettings.automaticRepliesEnabled": true,
+    })),
+  isAutomaticSendEnabled: () => env.AI_AUTOMATIC_SEND_ENABLED,
   changeResponseMode: setConversationResponseMode,
 };
 
@@ -351,6 +361,30 @@ export function createConversationsRouter(
     }
 
     try {
+      if (parsedBody.data.responseMode === "ai_automatic") {
+        if (!dependencies.isAutomaticSendEnabled()) {
+          response.status(409).json({
+            success: false,
+            message: "Automatic replies are not enabled for this application.",
+            code: "automatic_send_disabled",
+          });
+          return;
+        }
+
+        const automaticRepliesEnabled = await dependencies.automaticRepliesEnabled(
+          new Types.ObjectId(auth.businessId),
+          new Types.ObjectId(auth.userId),
+        );
+        if (!automaticRepliesEnabled) {
+          response.status(409).json({
+            success: false,
+            message: "Enable automatic replies for this business before selecting this response mode.",
+            code: "business_automatic_replies_disabled",
+          });
+          return;
+        }
+      }
+
       const result = await dependencies.changeResponseMode(
         new Types.ObjectId(auth.businessId),
         new Types.ObjectId(parsedId.data),
@@ -376,7 +410,6 @@ export function createConversationsRouter(
         });
         return;
       }
-
       response.status(200).json({
         success: true,
         message: result.kind === "already_set"

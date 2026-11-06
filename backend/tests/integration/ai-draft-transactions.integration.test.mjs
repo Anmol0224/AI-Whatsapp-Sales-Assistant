@@ -5,15 +5,20 @@ import { AiReplyJob } from "../../dist/models/ai-reply-job.model.js";
 import { Business } from "../../dist/models/business.model.js";
 import { Conversation } from "../../dist/models/conversation.model.js";
 import { Customer } from "../../dist/models/customer.model.js";
+import { Faq } from "../../dist/models/faq.model.js";
 import { Message } from "../../dist/models/message.model.js";
 import {
   approveAiReplyDraft,
   cancelProcessingAiReplyJob,
   claimQueuedAiReplyJob,
   completeAiReplySend,
+  finishAutomaticAiReplyJob,
+  persistAutomaticAiReply,
   rejectAiReplyDraft,
   recoverExpiredAiReplySendReservations,
+  reserveAiAutomaticReplyForSending,
   reserveAiReplyDraftForSending,
+  recoverExpiredAiReplyJobsForWorker,
   saveAiReplyDraft,
   setConversationResponseMode,
   takeOverConversation,
@@ -27,6 +32,7 @@ const createdIds = {
   conversations: [],
   messages: [],
   jobs: [],
+  faqs: [],
 };
 
 function getVerifiedTestUri() {
@@ -105,6 +111,13 @@ after(async () => {
       for (const id of createdIds.messages) {
         try {
           await Message.deleteOne({ _id: id }).exec();
+        } catch {
+          cleanupFailed = true;
+        }
+      }
+      for (const id of createdIds.faqs) {
+        try {
+          await Faq.deleteOne({ _id: id }).exec();
         } catch {
           cleanupFailed = true;
         }
@@ -214,6 +227,78 @@ async function createDraftReadyFixture() {
   return fixture;
 }
 
+async function createAutomaticReadyFixture(options = {}) {
+  const businessId = new Types.ObjectId();
+  const customerId = new Types.ObjectId();
+  const conversationId = new Types.ObjectId();
+  const inboundMessageId = new Types.ObjectId();
+  const jobId = new Types.ObjectId();
+  const faqId = new Types.ObjectId();
+  const ownerUserId = new Types.ObjectId();
+  const now = new Date();
+  const policyVersion = new Types.ObjectId().toString();
+  const phoneNumber = testPhoneNumber();
+  const phoneNumberId = testPhoneNumberId();
+  const question = "What is your return policy?";
+  const answer = "Returns are accepted within 14 days.";
+
+  createdIds.businesses.push(businessId);
+  createdIds.customers.push(customerId);
+  createdIds.conversations.push(conversationId);
+  createdIds.messages.push(inboundMessageId);
+  createdIds.jobs.push(jobId);
+  createdIds.faqs.push(faqId);
+
+  await Business.create({
+    _id: businessId,
+    ownerUserId,
+    name: "Automatic reservation integration fixture",
+    whatsapp: { phoneNumberId, connectionStatus: "configured_not_verified" },
+    aiSettings: {
+      automaticRepliesEnabled: true,
+      automaticRepliesPolicyVersion: policyVersion,
+      automaticRepliesControlVersion: 0,
+    },
+  });
+  await Customer.create({ _id: customerId, businessId, phoneNumber, profileName: "Test customer" });
+  await Conversation.create({
+    _id: conversationId,
+    businessId,
+    customerId,
+    status: "open",
+    responseMode: "ai_automatic",
+    aiControlVersion: 0,
+  });
+  await Message.create({
+    _id: inboundMessageId,
+    businessId,
+    conversationId,
+    customerId,
+    direction: "inbound",
+    messageType: "text",
+    text: options.inboundText ?? question,
+    status: "received",
+    timestamp: now,
+  });
+  await Faq.create({ _id: faqId, businessId, question, answer, isActive: true });
+  await AiReplyJob.create({
+    _id: jobId,
+    businessId,
+    conversationId,
+    inboundMessageId,
+    workflow: "ai_automatic",
+    status: "automatic_ready",
+    attemptCount: 0,
+    nextAttemptAt: now,
+    automaticReplyTextSnapshot: answer,
+    automaticSafetyDecision: "eligible",
+    automaticPolicyVersion: policyVersion,
+    workflowControlVersion: 0,
+  });
+
+  return { businessId, customerId, conversationId, inboundMessageId, jobId, faqId, answer, question, policyVersion };
+}
+
 function testPhoneNumber() {
   return `919${String(Date.now()).slice(-9)}`;
 }
@@ -239,6 +324,13 @@ async function createIngestionWorkspace(options = {}) {
     ownerUserId,
     name: "Concurrent integration test business",
     whatsapp: { phoneNumberId, connectionStatus: "configured_not_verified" },
+    ...(options.automaticRepliesEnabled === undefined ? {} : {
+      aiSettings: {
+        automaticRepliesEnabled: options.automaticRepliesEnabled,
+        automaticRepliesPolicyVersion: options.policyVersion,
+        automaticRepliesControlVersion: 0,
+      },
+    }),
   });
 
   if (options.createCustomer !== false) {
@@ -304,9 +396,13 @@ function createQueryBarrier(label, expectedArrivals) {
     resolveGate = resolve;
     rejectGate = reject;
   });
+  // A barrier can time out before any query has started awaiting it. Keep that
+  // rejection observed while preserving rejection for any operation at gate.
+  void gate.catch(() => {});
   const timer = setTimeout(() => rejectGate(new Error(`${label} synchronization barrier timed out after ${arrivals}/${expectedArrivals} arrivals.`)), 15_000);
   return {
     get arrivals() { return arrivals; },
+    cancel() { clearTimeout(timer); },
     async arrive() {
       arrivals += 1;
       if (arrivals === expectedArrivals) {
@@ -331,7 +427,86 @@ async function withMongoCommandBarrier(label, matcher, operation) {
     return results;
   } finally {
     mongoose.Query.prototype.exec = originalExec;
+    barrier.cancel();
   }
+}
+
+const automaticSendGateEnabled = () => true;
+
+async function assertAutomaticFixtureState(fixture, expected = {}) {
+  const expectedMode = expected.responseMode ?? "ai_automatic";
+  const expectedControlVersion = expected.controlVersion ?? 0;
+  const expectedJobId = expected.jobId ?? fixture.jobId;
+  const expectedJobControlVersion = expected.jobControlVersion ?? expectedControlVersion;
+  const expectedPolicyVersion = expected.policyVersion ?? fixture.policyVersion;
+  const [business, conversation, job] = await Promise.all([
+    Business.findOne({ _id: fixture.businessId })
+      .select({ "aiSettings.automaticRepliesEnabled": 1, "aiSettings.automaticRepliesPolicyVersion": 1 })
+      .lean().exec(),
+    Conversation.findOne({ _id: fixture.conversationId, businessId: fixture.businessId })
+      .select({ responseMode: 1, aiControlVersion: 1 })
+      .lean().exec(),
+    AiReplyJob.findOne({ _id: expectedJobId, businessId: fixture.businessId })
+      .select({ automaticPolicyVersion: 1, workflowControlVersion: 1 })
+      .lean().exec(),
+  ]);
+
+  assert.ok(business, "automatic-send fixture Business must exist");
+  assert.equal(business.aiSettings?.automaticRepliesEnabled, true, "automatic-send fixture must persist owner opt-in");
+  assert.equal(
+    business.aiSettings?.automaticRepliesPolicyVersion,
+    expectedPolicyVersion,
+    "automatic-send fixture must persist the expected policy version",
+  );
+  assert.equal(automaticSendGateEnabled(), true, "automatic-send global test gate must be enabled");
+  assert.ok(conversation, "automatic-send fixture Conversation must exist in the fixture business");
+  assert.equal(conversation.responseMode, expectedMode, "automatic-send fixture must persist the expected response mode");
+  assert.equal(conversation.aiControlVersion, expectedControlVersion, "automatic-send fixture must persist the expected control version");
+  assert.ok(job, "automatic-send fixture job must exist in the fixture business");
+  assert.equal(job.automaticPolicyVersion, expectedPolicyVersion, "automatic-send job must snapshot the expected policy version");
+  assert.equal(job.workflowControlVersion, expectedJobControlVersion, "automatic-send job must snapshot the expected control version");
+}
+
+function safeAutomaticReservationDiagnostic(result) {
+  const validation = result?.validation;
+  return JSON.stringify({
+    category: result?.kind,
+    ...(validation ? {
+      decision: validation.decision,
+      reasonCode: validation.reasonCode,
+      ...(validation.policyVersion === undefined ? {} : { policyVersion: validation.policyVersion }),
+      ...(validation.expectedPolicyVersion === undefined ? {} : { expectedPolicyVersion: validation.expectedPolicyVersion }),
+      ...(validation.controlVersion === undefined ? {} : { controlVersion: validation.controlVersion }),
+      ...(validation.expectedControlVersion === undefined ? {} : { expectedControlVersion: validation.expectedControlVersion }),
+    } : {}),
+  });
+}
+
+function assertAutomaticReservationKind(result, expectedKind, label) {
+  assert.equal(
+    result.kind,
+    expectedKind,
+    `${label}: ${safeAutomaticReservationDiagnostic(result)}`,
+  );
+}
+
+function assertAutomaticSafetyReason(result, expectedReasonCode, label) {
+  assertAutomaticReservationKind(result, "safety_rejected", label);
+  assert.equal(
+    result.validation.reasonCode,
+    expectedReasonCode,
+    `${label}: ${safeAutomaticReservationDiagnostic(result)}`,
+  );
+}
+
+function reservationJobReadMatcher(businessId, jobIds) {
+  const expectedIds = new Set(jobIds.map((id) => id.toString()));
+  return (query) => {
+    const filter = query.getFilter();
+    return query.op === "findOne" && query.model?.modelName === "AiReplyJob" &&
+      filter.businessId?.toString() === businessId.toString() &&
+      expectedIds.has(filter._id?.toString());
+  };
 }
 
 function assertConcurrentOperationsFulfilled(label, results) {
@@ -937,6 +1112,271 @@ test("real ingestion transaction commits an inbound message, fence and queued AI
   assert.equal(jobs[0].inboundMessageId.toString(), message._id.toString());
 });
 
+test("eligible automatic inbound atomically creates one automatic job and duplicate delivery creates none", async () => {
+  await assertRequiredUniqueIndex(AiReplyJob, "ai_reply_jobs_business_inbound_unique", { businessId: 1, inboundMessageId: 1 });
+  const policyVersion = new Types.ObjectId().toString();
+  const workspace = await createIngestionWorkspace({
+    responseMode: "ai_automatic",
+    automaticRepliesEnabled: true,
+    policyVersion,
+  });
+  const payload = incomingTextPayload(workspace, `wamid.auto-enqueue-${new Types.ObjectId()}`);
+  const options = { aiDraftWorkerEnabled: false, aiAutomaticSendEnabled: true };
+  assert.deepEqual(await ingestWhatsAppPayload(payload, undefined, options), {
+    kind: "accepted", inserted: 1, duplicates: 0,
+  });
+  assert.deepEqual(await ingestWhatsAppPayload(payload, undefined, options), {
+    kind: "accepted", inserted: 0, duplicates: 1,
+  });
+
+  const [messages, conversation, jobs, business] = await Promise.all([
+    Message.find({ businessId: workspace.businessId, direction: "inbound" }).select({ _id: 1 }).lean().exec(),
+    Conversation.findOne({ _id: workspace.conversationId, businessId: workspace.businessId })
+      .select({ aiControlVersion: 1, responseMode: 1 }).lean().exec(),
+    AiReplyJob.find({ businessId: workspace.businessId }).select({ workflow: 1, status: 1, inboundMessageId: 1, automaticPolicyVersion: 1, workflowControlVersion: 1 }).lean().exec(),
+    Business.findOne({ _id: workspace.businessId }).select({ "aiSettings.automaticRepliesControlVersion": 1 }).lean().exec(),
+  ]);
+  createdIds.jobs.push(...jobs.map((job) => job._id));
+  assert.equal(messages.length, 1);
+  assert.equal(conversation.responseMode, "ai_automatic");
+  assert.equal(conversation.aiControlVersion, 1);
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].workflow, "ai_automatic");
+  assert.equal(jobs[0].status, "queued");
+  assert.equal(jobs[0].automaticPolicyVersion, policyVersion);
+  assert.equal(jobs[0].workflowControlVersion, 1);
+  assert.equal(jobs[0].inboundMessageId.toString(), messages[0]._id.toString());
+  assert.equal(business.aiSettings.automaticRepliesControlVersion, 1);
+});
+
+test("concurrent duplicate automatic webhook deliveries persist one message, one job and one fence increment", async () => {
+  const policyVersion = new Types.ObjectId().toString();
+  const workspace = await createIngestionWorkspace({
+    responseMode: "ai_automatic", automaticRepliesEnabled: true, policyVersion,
+  });
+  const payload = incomingTextPayload(workspace, `wamid.auto-concurrent-duplicate-${new Types.ObjectId()}`);
+  const settled = await Promise.allSettled([
+    ingestWhatsAppPayload(payload, undefined, { aiAutomaticSendEnabled: true }),
+    ingestWhatsAppPayload(payload, undefined, { aiAutomaticSendEnabled: true }),
+  ]);
+  const results = assertConcurrentOperationsFulfilled("concurrent duplicate automatic ingestion", settled);
+  assert.equal(results.reduce((sum, result) => sum + result.inserted, 0), 1);
+  assert.equal(results.reduce((sum, result) => sum + result.duplicates, 0), 1);
+  const [messages, conversation, jobs, business] = await Promise.all([
+    Message.find({ businessId: workspace.businessId, direction: "inbound" }).select({ _id: 1 }).lean().exec(),
+    Conversation.findOne({ _id: workspace.conversationId, businessId: workspace.businessId }).select({ aiControlVersion: 1 }).lean().exec(),
+    AiReplyJob.find({ businessId: workspace.businessId }).select({ workflow: 1 }).lean().exec(),
+    Business.findOne({ _id: workspace.businessId }).select({ "aiSettings.automaticRepliesControlVersion": 1 }).lean().exec(),
+  ]);
+  createdIds.jobs.push(...jobs.map((job) => job._id));
+  assert.equal(messages.length, 1);
+  assert.equal(conversation.aiControlVersion, 1);
+  assert.equal(jobs.length, 1);
+  assert.equal(jobs[0].workflow, "ai_automatic");
+  assert.equal(business.aiSettings.automaticRepliesControlVersion, 1);
+});
+
+test("concurrent distinct automatic inbound messages create two jobs and retain both fences", async () => {
+  const policyVersion = new Types.ObjectId().toString();
+  const workspace = await createIngestionWorkspace({
+    responseMode: "ai_automatic", automaticRepliesEnabled: true, policyVersion,
+  });
+  const settled = await Promise.allSettled([
+    ingestWhatsAppPayload(incomingTextPayload(workspace, `wamid.auto-distinct-a-${new Types.ObjectId()}`), undefined, { aiAutomaticSendEnabled: true }),
+    ingestWhatsAppPayload(incomingTextPayload(workspace, `wamid.auto-distinct-b-${new Types.ObjectId()}`), undefined, { aiAutomaticSendEnabled: true }),
+  ]);
+  const results = assertConcurrentOperationsFulfilled("concurrent distinct automatic ingestion", settled);
+  assert.deepEqual(results, [
+    { kind: "accepted", inserted: 1, duplicates: 0 },
+    { kind: "accepted", inserted: 1, duplicates: 0 },
+  ]);
+  const [messages, conversation, jobs, business] = await Promise.all([
+    Message.find({ businessId: workspace.businessId, direction: "inbound" }).select({ _id: 1 }).lean().exec(),
+    Conversation.findOne({ _id: workspace.conversationId, businessId: workspace.businessId }).select({ aiControlVersion: 1 }).lean().exec(),
+    AiReplyJob.find({ businessId: workspace.businessId }).select({ workflow: 1, inboundMessageId: 1 }).lean().exec(),
+    Business.findOne({ _id: workspace.businessId }).select({ "aiSettings.automaticRepliesControlVersion": 1 }).lean().exec(),
+  ]);
+  createdIds.jobs.push(...jobs.map((job) => job._id));
+  assert.equal(messages.length, 2);
+  assert.equal(conversation.aiControlVersion, 2);
+  assert.equal(jobs.length, 2);
+  assert.ok(jobs.every((job) => job.workflow === "ai_automatic"));
+  assert.equal(new Set(jobs.map((job) => job.inboundMessageId.toString())).size, 2);
+  assert.equal(business.aiSettings.automaticRepliesControlVersion, 2);
+});
+
+test("automatic inbound fails closed when the global gate or business opt-in is disabled", async (context) => {
+  await context.test("global gate disabled", async () => {
+    const policyVersion = new Types.ObjectId().toString();
+    const workspace = await createIngestionWorkspace({ responseMode: "ai_automatic", automaticRepliesEnabled: true, policyVersion });
+    const result = await ingestWhatsAppPayload(
+      incomingTextPayload(workspace, `wamid.auto-gate-off-${new Types.ObjectId()}`),
+      undefined,
+      { aiAutomaticSendEnabled: false },
+    );
+    assert.equal(result.kind, "accepted");
+    assert.equal(await AiReplyJob.countDocuments({ businessId: workspace.businessId }), 0);
+    assert.equal(await Message.countDocuments({ businessId: workspace.businessId }), 1);
+  });
+  await context.test("business opt-in disabled", async () => {
+    const policyVersion = new Types.ObjectId().toString();
+    const workspace = await createIngestionWorkspace({ responseMode: "ai_automatic", automaticRepliesEnabled: false, policyVersion });
+    const result = await ingestWhatsAppPayload(
+      incomingTextPayload(workspace, `wamid.auto-optout-${new Types.ObjectId()}`),
+      undefined,
+      { aiAutomaticSendEnabled: true },
+    );
+    assert.equal(result.kind, "accepted");
+    assert.equal(await AiReplyJob.countDocuments({ businessId: workspace.businessId }), 0);
+    assert.equal(await Message.countDocuments({ businessId: workspace.businessId }), 1);
+  });
+});
+
+test("automatic job insertion failure rolls back inbound message and both control fences", async () => {
+  const policyVersion = new Types.ObjectId().toString();
+  const workspace = await createIngestionWorkspace({
+    responseMode: "ai_automatic", automaticRepliesEnabled: true, policyVersion,
+  });
+  const originalCreate = AiReplyJob.create;
+  let insertionReached = false;
+  AiReplyJob.create = async function (documents, options) {
+    insertionReached = true;
+    const error = new Error("Injected isolated test failure");
+    throw error;
+  };
+  try {
+    await assert.rejects(ingestWhatsAppPayload(
+      incomingTextPayload(workspace, `wamid.auto-rollback-${new Types.ObjectId()}`),
+      undefined,
+      { aiAutomaticSendEnabled: true },
+    ));
+  } finally {
+    AiReplyJob.create = originalCreate;
+  }
+  assert.equal(insertionReached, true);
+  const [messages, conversation, business, jobs] = await Promise.all([
+    Message.find({ businessId: workspace.businessId }).select({ _id: 1 }).lean().exec(),
+    Conversation.findOne({ _id: workspace.conversationId, businessId: workspace.businessId }).select({ aiControlVersion: 1 }).lean().exec(),
+    Business.findOne({ _id: workspace.businessId }).select({ "aiSettings.automaticRepliesControlVersion": 1 }).lean().exec(),
+    AiReplyJob.find({ businessId: workspace.businessId }).select({ _id: 1 }).lean().exec(),
+  ]);
+  createdIds.jobs.push(...jobs.map((job) => job._id));
+  assert.equal(messages.length, 0);
+  assert.equal(conversation.aiControlVersion, 0);
+  assert.equal(business.aiSettings.automaticRepliesControlVersion, 0);
+  assert.equal(jobs.length, 0);
+});
+
+test("automatic reply snapshot persistence is transactionally fenced by current mode, policy and inbound", async () => {
+  const fixture = await createAutomaticReadyFixture();
+  const leaseExpiresAt = new Date(Date.now() + 60_000);
+  await AiReplyJob.updateOne({ _id: fixture.jobId, businessId: fixture.businessId }, {
+    $set: { status: "processing", attemptCount: 1, leaseExpiresAt, lockedAt: new Date(), automaticSafetyDecision: "uncertain" },
+    $unset: { automaticReplyTextSnapshot: 1 },
+  }).exec();
+  const result = await persistAutomaticAiReply({
+    businessId: fixture.businessId,
+    conversationId: fixture.conversationId,
+    jobId: fixture.jobId,
+    inboundMessageId: fixture.inboundMessageId,
+    attemptCount: 1,
+    expectedPolicyVersion: fixture.policyVersion,
+    expectedControlVersion: 0,
+    safeReplyText: fixture.answer,
+    evidence: [{ kind: "faq", recordId: fixture.faqId.toString() }],
+    globalGateEnabled: true,
+  });
+  assert.equal(result.kind, "ready");
+  const [conversation, job, business] = await Promise.all([
+    Conversation.findOne({ _id: fixture.conversationId, businessId: fixture.businessId }).select({ responseMode: 1, aiControlVersion: 1 }).lean().exec(),
+    AiReplyJob.findOne({ _id: fixture.jobId, businessId: fixture.businessId }).select({ status: 1, automaticReplyTextSnapshot: 1, automaticSafetyDecision: 1, automaticEvidence: 1, workflowControlVersion: 1 }).lean().exec(),
+    Business.findOne({ _id: fixture.businessId }).select({ "aiSettings.automaticRepliesControlVersion": 1 }).lean().exec(),
+  ]);
+  assert.equal(conversation.responseMode, "ai_automatic");
+  assert.equal(conversation.aiControlVersion, 1);
+  assert.equal(job.status, "automatic_ready");
+  assert.equal(job.automaticReplyTextSnapshot, fixture.answer);
+  assert.equal(job.automaticSafetyDecision, "eligible");
+  assert.equal(job.automaticEvidence.length, 1);
+  assert.equal(job.workflowControlVersion, 1);
+  assert.equal(business.aiSettings.automaticRepliesControlVersion, 1);
+});
+
+test("automatic snapshot transaction rejects Human takeover and stale business policy", async (context) => {
+  await context.test("Human takeover before persistence", async () => {
+    const fixture = await createAutomaticReadyFixture();
+    const leaseExpiresAt = new Date(Date.now() + 60_000);
+    await AiReplyJob.updateOne({ _id: fixture.jobId, businessId: fixture.businessId }, {
+      $set: { status: "processing", attemptCount: 1, leaseExpiresAt, lockedAt: new Date(), automaticSafetyDecision: "uncertain" },
+      $unset: { automaticReplyTextSnapshot: 1 },
+    }).exec();
+    assert.deepEqual(await setConversationResponseMode(fixture.businessId, fixture.conversationId, "human"), {
+      kind: "updated", responseMode: "human",
+    });
+    const result = await persistAutomaticAiReply({
+      businessId: fixture.businessId, conversationId: fixture.conversationId,
+      jobId: fixture.jobId, inboundMessageId: fixture.inboundMessageId,
+      attemptCount: 1, expectedPolicyVersion: fixture.policyVersion,
+      expectedControlVersion: 0, safeReplyText: fixture.answer,
+      evidence: [{ kind: "faq", recordId: fixture.faqId.toString() }], globalGateEnabled: true,
+    });
+    assert.equal(result.kind, "mode_changed");
+    const job = await AiReplyJob.findOne({ _id: fixture.jobId, businessId: fixture.businessId })
+      .select({ status: 1, automaticReplyTextSnapshot: 1 }).lean().exec();
+    assert.equal(job.status, "processing");
+    assert.equal(job.automaticReplyTextSnapshot, undefined);
+  });
+
+  await context.test("business policy change before persistence", async () => {
+    const fixture = await createAutomaticReadyFixture();
+    const leaseExpiresAt = new Date(Date.now() + 60_000);
+    await AiReplyJob.updateOne({ _id: fixture.jobId, businessId: fixture.businessId }, {
+      $set: { status: "processing", attemptCount: 1, leaseExpiresAt, lockedAt: new Date(), automaticSafetyDecision: "uncertain" },
+      $unset: { automaticReplyTextSnapshot: 1 },
+    }).exec();
+    await Business.updateOne({ _id: fixture.businessId }, {
+      $set: { "aiSettings.automaticRepliesPolicyVersion": new Types.ObjectId().toString() },
+      $inc: { "aiSettings.automaticRepliesControlVersion": 1 },
+    }).exec();
+    const result = await persistAutomaticAiReply({
+      businessId: fixture.businessId, conversationId: fixture.conversationId,
+      jobId: fixture.jobId, inboundMessageId: fixture.inboundMessageId,
+      attemptCount: 1, expectedPolicyVersion: fixture.policyVersion,
+      expectedControlVersion: 0, safeReplyText: fixture.answer,
+      evidence: [{ kind: "faq", recordId: fixture.faqId.toString() }], globalGateEnabled: true,
+    });
+    assert.equal(result.kind, "policy_changed");
+    const job = await AiReplyJob.findOne({ _id: fixture.jobId, businessId: fixture.businessId })
+      .select({ status: 1, automaticReplyTextSnapshot: 1 }).lean().exec();
+    assert.equal(job.status, "processing");
+    assert.equal(job.automaticReplyTextSnapshot, undefined);
+  });
+});
+
+test("expired automatic_ready dispatch lease is released and safely reclaimable without regeneration", async () => {
+  const fixture = await createAutomaticReadyFixture();
+  const expiredAt = new Date(Date.now() - 1);
+  await AiReplyJob.updateOne({ _id: fixture.jobId, businessId: fixture.businessId }, {
+    $set: { lockedAt: expiredAt, leaseExpiresAt: expiredAt },
+  }).exec();
+  const recovered = await recoverExpiredAiReplyJobsForWorker(new Date());
+  assert.ok(recovered >= 1);
+  const claimed = await claimQueuedAiReplyJob(fixture.businessId, { now: new Date() });
+  assert.equal(claimed?._id.toString(), fixture.jobId.toString());
+  assert.equal(claimed?.status, "automatic_ready");
+  assert.equal(claimed?.automaticReplyTextSnapshot, fixture.answer);
+  assert.ok(claimed?.leaseExpiresAt > new Date());
+  const finished = await finishAutomaticAiReplyJob({
+    businessId: fixture.businessId,
+    jobId: fixture.jobId,
+    attemptCount: claimed.attemptCount,
+    leaseExpiresAt: claimed.leaseExpiresAt,
+    status: "cancelled",
+    automaticSafetyDecision: "uncertain",
+  });
+  assert.equal(finished?.status, "cancelled");
+});
+
 test("real ingestion transaction rolls back inbound persistence when queued job creation fails", async () => {
   await assertRequiredUniqueIndex(AiReplyJob, "ai_reply_jobs_business_inbound_unique", { businessId: 1, inboundMessageId: 1 });
   const workspace = await createIngestionWorkspace({ responseMode: "ai" });
@@ -1040,6 +1480,56 @@ test("Human takeover committed before inbound conversation fencing prevents a qu
   assert.equal(jobs.length, 0);
 });
 
+test("Human takeover committed before automatic inbound fencing prevents automatic job creation", async () => {
+  const policyVersion = new Types.ObjectId().toString();
+  const workspace = await createIngestionWorkspace({
+    responseMode: "ai_automatic", automaticRepliesEnabled: true, policyVersion,
+  });
+  let releaseIngestion;
+  let reachedFence;
+  const atFence = new Promise((resolve) => { reachedFence = resolve; });
+  const ingestionMayContinue = new Promise((resolve) => { releaseIngestion = resolve; });
+  const originalExec = mongoose.Query.prototype.exec;
+  let intercepted = false;
+  mongoose.Query.prototype.exec = async function (...args) {
+    const isFenceWrite = this.model?.modelName === "Conversation" && this.op === "updateOne" &&
+      this._conditions?._id?.toString() === workspace.conversationId.toString() &&
+      this._conditions?.businessId?.toString() === workspace.businessId.toString();
+    if (isFenceWrite && !intercepted) {
+      intercepted = true;
+      reachedFence();
+      await ingestionMayContinue;
+    }
+    return originalExec.apply(this, args);
+  };
+  const ingestion = ingestWhatsAppPayload(
+    incomingTextPayload(workspace, `wamid.auto-takeover-race-${new Types.ObjectId()}`),
+    undefined,
+    { aiAutomaticSendEnabled: true },
+  );
+  try {
+    await atFence;
+    assert.deepEqual(await setConversationResponseMode(workspace.businessId, workspace.conversationId, "human"), {
+      kind: "updated", responseMode: "human",
+    });
+  } finally {
+    mongoose.Query.prototype.exec = originalExec;
+    releaseIngestion();
+  }
+  assert.deepEqual(await ingestion, { kind: "accepted", inserted: 1, duplicates: 0 });
+  const [messages, conversation, jobs] = await Promise.all([
+    Message.find({ businessId: workspace.businessId, direction: "inbound" }).select({ _id: 1 }).lean().exec(),
+    Conversation.findOne({ _id: workspace.conversationId, businessId: workspace.businessId }).select({ responseMode: 1, aiControlVersion: 1 }).lean().exec(),
+    AiReplyJob.find({ businessId: workspace.businessId }).select({ _id: 1 }).lean().exec(),
+  ]);
+  createdIds.jobs.push(...jobs.map((job) => job._id));
+  assert.equal(intercepted, true);
+  assert.equal(messages.length, 1);
+  assert.equal(conversation.responseMode, "human");
+  assert.equal(conversation.aiControlVersion, 2);
+  assert.equal(jobs.length, 0);
+});
+
 test("inbound persistence racing approval never leaves a stale draft reservable", async () => {
   const fixture = await createDraftReadyFixture();
   const workspace = await createIngestionWorkspace({
@@ -1093,11 +1583,14 @@ test("inbound persistence racing approval never leaves a stale draft reservable"
 test("approval racing human takeover always ends in human mode without a send marker", async () => {
   const fixture = await createDraftReadyFixture();
   const matcher = (query) => {
+    const filter = query.getFilter();
+    const update = query.getUpdate();
+    const allowedModes = filter.responseMode?.$in;
     if (query.model?.modelName !== "Conversation" || query.op !== "findOneAndUpdate" ||
-      query._conditions?._id?.toString() !== fixture.conversationId.toString() ||
-      query._conditions?.responseMode !== "ai") return false;
-    return query._conditions?.aiControlVersion !== undefined ||
-      query._update?.$set?.responseMode === "human";
+      filter._id?.toString() !== fixture.conversationId.toString() ||
+      filter.businessId?.toString() !== fixture.businessId.toString() ||
+      !Array.isArray(allowedModes) || !allowedModes.includes("ai")) return false;
+    return filter.aiControlVersion !== undefined || update?.$set?.responseMode === "human";
   };
 
   const settled = await withMongoCommandBarrier("approval versus takeover conversation writes", matcher, () =>
@@ -1207,4 +1700,269 @@ test("concurrent duplicate webhook deliveries persist exactly one message and on
   assert.equal(messages[0].customerId.toString(), customers[0]._id.toString());
   assert.equal(messages[0].conversationId.toString(), conversations[0]._id.toString());
   assert.equal(conversations[0].aiControlVersion, 1);
+});
+
+test("automatic reservation revalidates current FAQ evidence and commits both shared fences before send", async () => {
+  const fixture = await createAutomaticReadyFixture();
+  await assertAutomaticFixtureState(fixture);
+  const reservation = await reserveAiAutomaticReplyForSending({
+    businessId: fixture.businessId,
+    jobId: fixture.jobId,
+    isAutomaticSendEnabled: automaticSendGateEnabled,
+  });
+  assertAutomaticReservationKind(reservation, "reserved", "eligible automatic reservation");
+  assert.equal(reservation.automaticReplyText, fixture.answer);
+
+  const [business, conversation, job] = await Promise.all([
+    Business.findOne({ _id: fixture.businessId })
+      .select({ "aiSettings.automaticRepliesControlVersion": 1 })
+      .lean().exec(),
+    Conversation.findOne({ _id: fixture.conversationId, businessId: fixture.businessId })
+      .select({ responseMode: 1, aiControlVersion: 1, activeAiSendJobId: 1 })
+      .lean().exec(),
+    AiReplyJob.findOne({ _id: fixture.jobId, businessId: fixture.businessId })
+      .select({ status: 1, workflow: 1, sendProvenance: 1, automaticReplyTextSnapshot: 1, approvedText: 1 })
+      .lean().exec(),
+  ]);
+  assert.equal(business.aiSettings.automaticRepliesControlVersion, 1);
+  assert.equal(conversation.responseMode, "ai_automatic");
+  assert.equal(conversation.aiControlVersion, 1);
+  assert.equal(conversation.activeAiSendJobId.toString(), fixture.jobId.toString());
+  assert.equal(job.status, "sending");
+  assert.equal(job.workflow, "ai_automatic");
+  assert.equal(job.sendProvenance, "automatic_policy");
+  assert.equal(job.automaticReplyTextSnapshot, fixture.answer);
+  assert.equal(job.approvedText, undefined);
+
+  const secondReservation = await reserveAiAutomaticReplyForSending({
+    businessId: fixture.businessId,
+    jobId: fixture.jobId,
+    isAutomaticSendEnabled: automaticSendGateEnabled,
+  });
+  assert.equal(secondReservation.kind, "in_progress");
+
+  const completion = await completeAiReplySend({
+    businessId: fixture.businessId,
+    jobId: fixture.jobId,
+    sendAttemptId: reservation.sendAttemptId,
+    providerMessageId: `wamid.auto-test-${new Types.ObjectId()}`,
+  });
+  assert.equal(completion.kind, "sent");
+  assert.equal(completion.message.text, fixture.answer);
+  assert.equal(completion.message.aiReplyJobId.toString(), fixture.jobId.toString());
+});
+
+test("competing automatic workers reserve one job at most once", async () => {
+  const fixture = await createAutomaticReadyFixture();
+  await assertAutomaticFixtureState(fixture);
+  const settled = await withMongoCommandBarrier(
+    "competing automatic reservation job reads",
+    reservationJobReadMatcher(fixture.businessId, [fixture.jobId, fixture.jobId]),
+    () => Promise.allSettled([
+      reserveAiAutomaticReplyForSending({ businessId: fixture.businessId, jobId: fixture.jobId, isAutomaticSendEnabled: automaticSendGateEnabled }),
+      reserveAiAutomaticReplyForSending({ businessId: fixture.businessId, jobId: fixture.jobId, isAutomaticSendEnabled: automaticSendGateEnabled }),
+    ]),
+  );
+  const results = assertConcurrentOperationsFulfilled("competing automatic reservations", settled);
+  assert.equal(results.filter((result) => result.kind === "reserved").length, 1, results.map(safeAutomaticReservationDiagnostic).join("; "));
+  assert.equal(results.filter((result) => result.kind === "in_progress").length, 1, results.map(safeAutomaticReservationDiagnostic).join("; "));
+  assert.equal(await AiReplyJob.countDocuments({
+    businessId: fixture.businessId,
+    conversationId: fixture.conversationId,
+    workflow: "ai_automatic",
+    status: "sending",
+  }).exec(), 1);
+});
+
+test("two eligible-looking automatic jobs for one conversation cannot both reserve", async () => {
+  const fixture = await createAutomaticReadyFixture();
+  const newerInboundMessageId = new Types.ObjectId();
+  const newerJobId = new Types.ObjectId();
+  const newerAt = new Date(Date.now() + 2_000);
+  createdIds.messages.push(newerInboundMessageId);
+  createdIds.jobs.push(newerJobId);
+  await Message.create({
+    _id: newerInboundMessageId,
+    businessId: fixture.businessId,
+    conversationId: fixture.conversationId,
+    customerId: fixture.customerId,
+    direction: "inbound",
+    messageType: "text",
+    text: fixture.question,
+    status: "received",
+    timestamp: newerAt,
+    createdAt: newerAt,
+    updatedAt: newerAt,
+  });
+  await Conversation.updateOne(
+    { _id: fixture.conversationId, businessId: fixture.businessId },
+    { $inc: { aiControlVersion: 1 } },
+  ).exec();
+  await AiReplyJob.create({
+    _id: newerJobId,
+    businessId: fixture.businessId,
+    conversationId: fixture.conversationId,
+    inboundMessageId: newerInboundMessageId,
+    workflow: "ai_automatic",
+    status: "automatic_ready",
+    attemptCount: 0,
+    nextAttemptAt: newerAt,
+    automaticReplyTextSnapshot: fixture.answer,
+    automaticSafetyDecision: "eligible",
+    automaticPolicyVersion: fixture.policyVersion,
+    workflowControlVersion: 1,
+  });
+
+  await assertAutomaticFixtureState(fixture, { controlVersion: 1, jobControlVersion: 0 });
+  await assertAutomaticFixtureState(fixture, {
+    jobId: newerJobId,
+    controlVersion: 1,
+    jobControlVersion: 1,
+  });
+
+  const settled = await withMongoCommandBarrier(
+    "automatic jobs entering reservation eligibility checks",
+    reservationJobReadMatcher(fixture.businessId, [fixture.jobId, newerJobId]),
+    () => Promise.allSettled([
+      reserveAiAutomaticReplyForSending({ businessId: fixture.businessId, jobId: fixture.jobId, isAutomaticSendEnabled: automaticSendGateEnabled }),
+      reserveAiAutomaticReplyForSending({ businessId: fixture.businessId, jobId: newerJobId, isAutomaticSendEnabled: automaticSendGateEnabled }),
+    ]),
+  );
+  const results = assertConcurrentOperationsFulfilled("same-conversation automatic jobs", settled);
+  assert.equal(results.filter((result) => result.kind === "reserved").length, 1, results.map(safeAutomaticReservationDiagnostic).join("; "));
+  assert.equal(results.filter((result) => result.kind === "safety_rejected").length, 1, results.map(safeAutomaticReservationDiagnostic).join("; "));
+  assert.equal(await AiReplyJob.countDocuments({
+    businessId: fixture.businessId,
+    conversationId: fixture.conversationId,
+    workflow: "ai_automatic",
+    status: "sending",
+  }).exec(), 1);
+});
+
+test("opt-out or changed FAQ policy before automatic reservation prevents sending", async (context) => {
+  await context.test("business opt-out", async () => {
+    const fixture = await createAutomaticReadyFixture();
+    await Business.updateOne(
+      { _id: fixture.businessId },
+      {
+        $set: {
+          "aiSettings.automaticRepliesEnabled": false,
+          "aiSettings.automaticRepliesPolicyVersion": new Types.ObjectId().toString(),
+        },
+        $inc: { "aiSettings.automaticRepliesControlVersion": 1 },
+      },
+    ).exec();
+    const result = await reserveAiAutomaticReplyForSending({
+      businessId: fixture.businessId, jobId: fixture.jobId, isAutomaticSendEnabled: () => true,
+    });
+    assertAutomaticSafetyReason(result, "automatic_replies_disabled", "business opt-out should block reservation");
+  });
+
+  await context.test("FAQ change rotates policy version", async () => {
+    const fixture = await createAutomaticReadyFixture();
+    await Faq.updateOne({ _id: fixture.faqId, businessId: fixture.businessId }, {
+      $set: { answer: "Returns are accepted within 30 days." },
+    }).exec();
+    await Business.updateOne({ _id: fixture.businessId }, {
+      $set: { "aiSettings.automaticRepliesPolicyVersion": new Types.ObjectId().toString() },
+      $inc: { "aiSettings.automaticRepliesControlVersion": 1 },
+    }).exec();
+    const result = await reserveAiAutomaticReplyForSending({
+      businessId: fixture.businessId, jobId: fixture.jobId, isAutomaticSendEnabled: () => true,
+    });
+    assertAutomaticSafetyReason(result, "stale_policy_version", "changed FAQ policy should block reservation");
+  });
+
+  await context.test("wrong business cannot reserve another business job", async () => {
+    const fixture = await createAutomaticReadyFixture();
+    const result = await reserveAiAutomaticReplyForSending({
+      businessId: new Types.ObjectId(), jobId: fixture.jobId, isAutomaticSendEnabled: () => true,
+    });
+    assert.equal(result.kind, "not_found");
+  });
+
+  await context.test("Human mode before reservation is escalated and not reserved", async () => {
+    const fixture = await createAutomaticReadyFixture();
+    await Conversation.updateOne(
+      { _id: fixture.conversationId, businessId: fixture.businessId },
+      { $set: { responseMode: "human" }, $inc: { aiControlVersion: 1 } },
+    ).exec();
+    const result = await reserveAiAutomaticReplyForSending({
+      businessId: fixture.businessId, jobId: fixture.jobId, isAutomaticSendEnabled: () => true,
+    });
+    assertAutomaticSafetyReason(result, "conversation_mode_mismatch", "Human mode should block reservation");
+  });
+});
+
+test("business opt-out racing automatic reservation has one transactionally ordered result", async () => {
+  const fixture = await createAutomaticReadyFixture();
+  await assertAutomaticFixtureState(fixture);
+  const settled = await withMongoCommandBarrier(
+    "automatic reservation and business opt-out entering operations",
+    (query) => {
+      const filter = query.getFilter();
+      const reservationRead = reservationJobReadMatcher(fixture.businessId, [fixture.jobId])(query);
+      const optOutWrite = query.op === "findOneAndUpdate" && query.model?.modelName === "Business" &&
+        filter._id?.toString() === fixture.businessId.toString();
+      return reservationRead || optOutWrite;
+    },
+    () => Promise.allSettled([
+      reserveAiAutomaticReplyForSending({
+        businessId: fixture.businessId, jobId: fixture.jobId, isAutomaticSendEnabled: automaticSendGateEnabled,
+      }),
+      Business.findOneAndUpdate(
+        { _id: fixture.businessId },
+        {
+          $set: {
+            "aiSettings.automaticRepliesEnabled": false,
+            "aiSettings.automaticRepliesPolicyVersion": new Types.ObjectId().toString(),
+          },
+          $inc: { "aiSettings.automaticRepliesControlVersion": 1 },
+        },
+        { returnDocument: "after" },
+      ).exec(),
+    ]),
+  );
+  const results = assertConcurrentOperationsFulfilled("automatic reservation versus business opt-out", settled);
+  const reservation = results.find((result) => result && typeof result.kind === "string");
+  const settingsUpdate = results.find((result) => result && typeof result.kind !== "string");
+  assert.ok(settingsUpdate);
+  assert.equal(settingsUpdate.aiSettings.automaticRepliesEnabled, false);
+  assert.ok(["reserved", "safety_rejected"].includes(reservation?.kind), safeAutomaticReservationDiagnostic(reservation));
+  if (reservation?.kind === "safety_rejected") {
+    assert.equal(reservation.validation.reasonCode, "automatic_replies_disabled", safeAutomaticReservationDiagnostic(reservation));
+  }
+});
+
+test("Human takeover racing automatic reservation never sends and leaves one safe winner", async () => {
+  const fixture = await createAutomaticReadyFixture();
+  await assertAutomaticFixtureState(fixture);
+  const settled = await withMongoCommandBarrier(
+    "automatic reservation and takeover entering operations",
+    (query) => {
+      const filter = query.getFilter();
+      const reservationRead = reservationJobReadMatcher(fixture.businessId, [fixture.jobId])(query);
+      const takeoverWrite = query.op === "findOneAndUpdate" && query.model?.modelName === "Conversation" &&
+        filter._id?.toString() === fixture.conversationId.toString() &&
+        filter.businessId?.toString() === fixture.businessId.toString();
+      return reservationRead || takeoverWrite;
+    },
+    () => Promise.allSettled([
+      reserveAiAutomaticReplyForSending({ businessId: fixture.businessId, jobId: fixture.jobId, isAutomaticSendEnabled: automaticSendGateEnabled }),
+      setConversationResponseMode(fixture.businessId, fixture.conversationId, "human"),
+    ]),
+  );
+  const [reservation, takeover] = assertConcurrentOperationsFulfilled("automatic reservation versus Human takeover", settled);
+  const conversation = await Conversation.findOne({ _id: fixture.conversationId, businessId: fixture.businessId })
+    .select({ responseMode: 1, activeAiSendJobId: 1 }).lean().exec();
+  if (conversation.responseMode === "human") {
+    assert.equal(takeover.kind, "updated");
+    assert.notEqual(reservation.kind, "reserved", safeAutomaticReservationDiagnostic(reservation));
+    assert.equal(conversation.activeAiSendJobId, undefined);
+  } else {
+    assert.equal(conversation.responseMode, "ai_automatic");
+    assertAutomaticReservationKind(reservation, "reserved", "automatic reservation should win before takeover");
+    assert.equal(takeover.kind, "send_in_progress");
+    assert.equal(conversation.activeAiSendJobId.toString(), fixture.jobId.toString());
+  }
 });

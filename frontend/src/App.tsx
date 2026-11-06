@@ -5,6 +5,7 @@ import { BusinessProfilePage } from './pages/BusinessProfilePage'
 import { AiDraftsPage } from './pages/AiDraftsPage'
 import { CatalogPage } from './pages/CatalogPage'
 import { DashboardPage } from './pages/DashboardPage'
+import { EscalationsPage } from './pages/EscalationsPage'
 import { FaqsPage } from './pages/FaqsPage'
 import { InboxPage } from './pages/InboxPage'
 import { LoginPage } from './pages/LoginPage'
@@ -14,6 +15,7 @@ const dashboardRoutes = {
   '/dashboard': { title: 'Overview' },
   '/dashboard/inbox': { title: 'Inbox' },
   '/dashboard/ai-drafts': { title: 'AI Drafts' },
+  '/dashboard/escalations': { title: 'Escalations' },
   '/dashboard/business': { title: 'Business Profile' },
   '/dashboard/catalog': { title: 'Products & Services' },
   '/dashboard/faqs': { title: 'FAQs' },
@@ -28,6 +30,7 @@ function isDashboardPath(pathname: string): boolean {
 function AppContent() {
   const { user, loading, restoreError, retryRestore, logout } = useAuth()
   const [pathname, setPathname] = useState(window.location.pathname)
+  const [inboxConversationId, setInboxConversationId] = useState<string | null>(null)
 
   useEffect(() => {
     const onPopState = () => setPathname(window.location.pathname)
@@ -84,9 +87,23 @@ function AppContent() {
     if (routePath === '/dashboard/business') {
       page = <BusinessProfilePage />
     } else if (routePath === '/dashboard/inbox') {
-      page = <InboxPage />
+      page = (
+        <InboxPage
+          initialConversationId={inboxConversationId}
+          onInitialConversationHandled={() => setInboxConversationId(null)}
+        />
+      )
     } else if (routePath === '/dashboard/ai-drafts') {
       page = <AiDraftsPage />
+    } else if (routePath === '/dashboard/escalations') {
+      page = (
+        <EscalationsPage
+          onOpenConversation={(conversationId) => {
+            setInboxConversationId(conversationId)
+            navigate('/dashboard/inbox')
+          }}
+        />
+      )
     } else if (routePath === '/dashboard/catalog') {
       page = <CatalogPage />
     } else if (routePath === '/dashboard/faqs') {

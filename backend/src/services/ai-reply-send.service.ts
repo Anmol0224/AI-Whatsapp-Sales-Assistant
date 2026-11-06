@@ -155,7 +155,9 @@ export function createAiReplySendService(dependencies: AiReplySendDependencies =
 
     const conversation = await dependencies.findConversation(job.conversationId, input.businessId);
     if (!conversation) return { kind: "not_found" };
-    if (conversation.responseMode !== "ai") return { kind: "conflict", reason: "mode_changed" };
+    if (conversation.responseMode !== "ai" && conversation.responseMode !== "ai_draft") {
+      return { kind: "conflict", reason: "mode_changed" };
+    }
     if (conversation.aiControlVersion !== job.approvedControlVersion) {
       return { kind: "conflict", reason: "stale_approval" };
     }

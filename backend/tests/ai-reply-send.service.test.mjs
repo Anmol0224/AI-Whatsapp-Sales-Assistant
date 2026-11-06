@@ -226,6 +226,15 @@ test('already-sent drafts return already_sent without provider calls', async () 
   assert.equal(state.calls.length, 0)
 })
 
+test('owner-approved draft sending remains available in ai_draft mode', async () => {
+  const { dependencies, state } = makeDependencies()
+  state.conversation.responseMode = 'ai_draft'
+  const result = await createAiReplySendService(dependencies)(sendInput)
+
+  assert.equal(result.kind, 'sent')
+  assert.equal(state.calls.filter(([kind]) => kind === 'sendText').length, 1)
+})
+
 test('an uncertain draft cannot trigger a second provider call', async () => {
   const { dependencies, state } = makeDependencies()
   state.job.status = 'send_uncertain'
@@ -244,6 +253,7 @@ test('unapproved, Human-mode, stale, unconfigured, and inaccessible records bloc
     ['unapproved draft', { job: { status: 'draft_ready' } }, { kind: 'conflict', reason: 'not_approved' }],
     ['rejected draft', { job: { status: 'rejected' } }, { kind: 'conflict', reason: 'not_approved' }],
     ['Human mode', { conversation: { responseMode: 'human' } }, { kind: 'conflict', reason: 'mode_changed' }],
+    ['Automatic mode is not an approved draft mode', { conversation: { responseMode: 'ai_automatic' } }, { kind: 'conflict', reason: 'mode_changed' }],
     ['stale approval', { conversation: { aiControlVersion: 8 } }, { kind: 'conflict', reason: 'stale_approval' }],
     ['missing WhatsApp configuration', { providerConfigured: false }, { kind: 'not_configured' }],
     ['missing phone number ID', { business: { whatsapp: { phoneNumberId: undefined } } }, { kind: 'not_configured' }],

@@ -4,6 +4,9 @@ import type { Server } from "node:http";
 import { connectDatabase } from "./config/database.js";
 import { env } from "./config/env.js";
 import { createAiDraftProcessor } from "./services/ai-draft-processor.service.js";
+import { createAiAutomaticReplyProcessor } from "./services/ai-automatic-reply-processor.service.js";
+import { businessContextService } from "./services/business-context.service.js";
+import { buildBusinessReplyPrompt } from "./services/business-prompt-builder.service.js";
 import { createAiSendRecoveryRuntime } from "./services/ai-send-recovery.runtime.js";
 import { createGeminiService } from "./services/gemini.service.js";
 import { createAiDraftWorkerRuntime } from "./workers/ai-draft.worker.js";
@@ -23,11 +26,18 @@ function startAiDraftWorkerIfConfigured(): void {
   }
 
   try {
+    const generator = createGeminiService({
+      apiKey: env.GEMINI_API_KEY,
+      model: env.GEMINI_MODEL,
+    });
+    const automaticProcessor = createAiAutomaticReplyProcessor({
+      contextService: businessContextService,
+      promptBuilder: buildBusinessReplyPrompt,
+      generator,
+    });
     const processor = createAiDraftProcessor({
-      generator: createGeminiService({
-        apiKey: env.GEMINI_API_KEY,
-        model: env.GEMINI_MODEL,
-      }),
+      generator,
+      automaticProcessor,
     });
     aiDraftWorker = createAiDraftWorkerRuntime({
       enabled: true,

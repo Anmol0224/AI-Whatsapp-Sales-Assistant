@@ -1,7 +1,9 @@
 import { Router } from "express";
+import { Types } from "mongoose";
 import { z } from "zod";
 import { authenticate } from "../../middleware/auth.middleware.js";
 import { Faq } from "../../models/faq.model.js";
+import { withAutomaticReplyPolicyMutation } from "../../services/automatic-reply-policy.repository.js";
 
 const faqsRouter = Router();
 const faqIdSchema = z.string().regex(/^[a-f\d]{24}$/i, "A valid FAQ ID is required.");
@@ -107,11 +109,19 @@ faqsRouter.post("/", async (request, response, next) => {
   }
 
   try {
-    const faq = await Faq.create({
-      ...parsedBody.data,
-      businessId: auth.businessId,
-      isActive: true,
+    const businessId = new Types.ObjectId(auth.businessId);
+    const faq = await withAutomaticReplyPolicyMutation(businessId, async (session) => {
+      const [created] = await Faq.create([{
+        ...parsedBody.data,
+        businessId,
+        isActive: true,
+      }], { session });
+      return created ?? null;
     });
+    if (!faq) {
+      response.status(404).json({ success: false, message: "Business not found." });
+      return;
+    }
     response.status(201).json({ success: true, faq: safeFaq(faq) });
   } catch (error) {
     next(error);
@@ -177,10 +187,13 @@ faqsRouter.patch("/:id", async (request, response, next) => {
   }
 
   try {
-    const faq = await Faq.findOneAndUpdate(
-      { _id: parsedId.data, businessId: auth.businessId },
-      { $set: parsedBody.data },
-      { returnDocument: "after", runValidators: true },
+    const businessId = new Types.ObjectId(auth.businessId);
+    const faq = await withAutomaticReplyPolicyMutation(businessId, (session) =>
+      Faq.findOneAndUpdate(
+        { _id: parsedId.data, businessId },
+        { $set: parsedBody.data },
+        { session, returnDocument: "after", runValidators: true },
+      ).exec(),
     );
 
     if (!faq) {
@@ -212,10 +225,13 @@ faqsRouter.delete("/:id", async (request, response, next) => {
   }
 
   try {
-    const faq = await Faq.findOneAndUpdate(
-      { _id: parsedId.data, businessId: auth.businessId },
-      { $set: { isActive: false } },
-      { returnDocument: "after", runValidators: true },
+    const businessId = new Types.ObjectId(auth.businessId);
+    const faq = await withAutomaticReplyPolicyMutation(businessId, (session) =>
+      Faq.findOneAndUpdate(
+        { _id: parsedId.data, businessId },
+        { $set: { isActive: false } },
+        { session, returnDocument: "after", runValidators: true },
+      ).exec(),
     );
 
     if (!faq) {

@@ -6,6 +6,7 @@ import { env } from "./config/env.js";
 import errorHandler from "./middleware/error-handler.js";
 import authRouter from "./routes/v1/auth.routes.js";
 import aiDraftsRouter, { createConversationAiDraftsRouter } from "./routes/v1/ai-drafts.routes.js";
+import aiEscalationsRouter from "./routes/v1/ai-escalations.routes.js";
 import businessRouter from "./routes/v1/business.routes.js";
 import catalogItemsRouter from "./routes/v1/catalog-items.routes.js";
 import conversationsRouter from "./routes/v1/conversations.routes.js";
@@ -127,6 +128,7 @@ app.use("/api/v1/auth", apiRateLimiter, authRouter);
 app.use("/api/v1/business", apiRateLimiter, businessRouter);
 app.use("/api/v1/catalog-items", apiRateLimiter, catalogItemsRouter);
 app.use("/api/v1/ai-drafts", apiRateLimiter, aiDraftsRouter);
+app.use("/api/v1/ai-escalations", apiRateLimiter, aiEscalationsRouter);
 app.use(
   "/api/v1/conversations/:conversationId/ai-drafts",
   apiRateLimiter,

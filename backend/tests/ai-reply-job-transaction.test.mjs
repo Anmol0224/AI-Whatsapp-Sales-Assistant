@@ -264,9 +264,9 @@ test('production transaction adapter passes the same Mongo session and full owne
     )
     assert.equal(calls.conversation[0].businessId, businessId)
     assert.equal(calls.conversation[0]._id, conversationId)
-    assert.equal(calls.conversation[0].responseMode, 'ai')
+    assert.deepEqual(calls.conversation[0].responseMode, { $in: ['ai', 'ai_draft'] })
     assert.deepEqual(calls.conversation[1], { $inc: { aiControlVersion: 1 } })
-    assert.equal(calls.conversation[0].responseMode, 'ai')
+    assert.deepEqual(calls.conversation[0].responseMode, { $in: ['ai', 'ai_draft'] })
     assert.ok(Array.isArray(calls.conversation[0].$or))
     assert.equal(calls.conversation[2].session, session)
     assert.equal(calls.job[0].businessId, businessId)
@@ -284,7 +284,7 @@ test('production transaction adapter passes the same Mongo session and full owne
     assert.deepEqual(await takeOverConversation(businessId, conversationId), { kind: 'taken_over' })
     assert.equal(calls.conversation[0].businessId, businessId)
     assert.equal(calls.conversation[0]._id, conversationId)
-    assert.equal(calls.conversation[0].responseMode, 'ai')
+    assert.deepEqual(calls.conversation[0].responseMode, { $in: ['ai', 'ai_draft', 'ai_automatic'] })
     assert.deepEqual(calls.conversation[1], {
       $set: { responseMode: 'human' },
       $inc: { aiControlVersion: 1 },

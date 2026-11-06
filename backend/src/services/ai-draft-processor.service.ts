@@ -25,6 +25,7 @@ import {
   buildBusinessReplyPrompt,
   type BusinessPromptBuildResult,
 } from "./business-prompt-builder.service.js";
+import type { AiAutomaticReplyProcessor } from "./ai-automatic-reply-processor.service.js";
 
 export const AI_DRAFT_RETRY_BASE_DELAY_MS = 1_000;
 export const AI_DRAFT_RETRY_MAX_DELAY_MS = 30_000;
@@ -38,6 +39,13 @@ export interface ClaimedAiReplyJob {
   attemptCount: number;
   createdAt?: Date;
   nextAttemptAt?: Date;
+  workflow?: "ai_draft" | "ai_automatic";
+  status?: string;
+  automaticPolicyVersion?: string;
+  workflowControlVersion?: number;
+  automaticSafetyDecision?: "eligible" | "unsupported" | "uncertain";
+  automaticReplyTextSnapshot?: string;
+  leaseExpiresAt?: Date;
 }
 
 export type AiDraftWorkerOutcome =
@@ -47,6 +55,10 @@ export type AiDraftWorkerOutcome =
   | { kind: "failed"; errorCode: string }
   | { kind: "retry_scheduled"; nextAttemptAt: Date }
   | { kind: "stale" }
+  | { kind: "sent" }
+  | { kind: "send_failed" }
+  | { kind: "send_uncertain" }
+  | { kind: "escalated" }
   | { kind: "deferred" };
 
 export interface AiDraftWorkerRepository {
@@ -55,7 +67,7 @@ export interface AiDraftWorkerRepository {
   findConversationMode(
     businessId: Types.ObjectId,
     conversationId: Types.ObjectId,
-  ): Promise<"human" | "ai" | null>;
+  ): Promise<"human" | "ai" | "ai_draft" | "ai_automatic" | null>;
   cancelCurrentAttempt(
     businessId: Types.ObjectId,
     jobId: Types.ObjectId,
@@ -107,6 +119,7 @@ export interface AiDraftProcessorOptions {
   contextService?: AiDraftContextService;
   promptBuilder?: AiDraftPromptBuilder;
   generator: AiDraftGenerator;
+  automaticProcessor?: AiAutomaticReplyProcessor;
   now?: () => Date;
 }
 
@@ -180,7 +193,7 @@ function safeGeminiDiagnosticFields(error: GeminiServiceError): {
   };
 }
 
-function categorizeGeminiFailure(error: unknown): {
+export function categorizeGeminiFailure(error: unknown): {
   retryable: boolean;
   errorCode: "provider_unavailable" | "provider_timeout" | "invalid_output" | "internal_error";
   providerCategory?: AiPipelineProviderCategory;
@@ -255,7 +268,7 @@ export function createAiDraftProcessor(options: AiDraftProcessorOptions) {
     businessId: Types.ObjectId,
     jobId: Types.ObjectId,
     conversationId: Types.ObjectId,
-  ): Promise<{ mode: "human" | "ai" | null } | { outcome: AiDraftWorkerOutcome }> {
+  ): Promise<{ mode: "human" | "ai" | "ai_draft" | "ai_automatic" | null } | { outcome: AiDraftWorkerOutcome }> {
     try {
       return { mode: await repository.findConversationMode(businessId, conversationId) };
     } catch (error) {
@@ -303,9 +316,14 @@ export function createAiDraftProcessor(options: AiDraftProcessorOptions) {
       return failOrRetry(job, businessId, jobId, "context_unavailable", false);
     }
 
+    if (job.workflow === "ai_automatic") {
+      if (!options.automaticProcessor) return cancel(job, businessId, jobId);
+      return options.automaticProcessor.process(job);
+    }
+
     const firstMode = await readConversationMode(job, businessId, jobId, conversationId);
     if ("outcome" in firstMode) return firstMode.outcome;
-    if (firstMode.mode !== "ai") return cancel(job, businessId, jobId);
+    if (firstMode.mode !== "ai" && firstMode.mode !== "ai_draft") return cancel(job, businessId, jobId);
 
     let contextResult: BusinessContextResult;
     const contextStartedAt = performance.now();
@@ -359,7 +377,9 @@ export function createAiDraftProcessor(options: AiDraftProcessorOptions) {
     // Avoid starting a provider request if human takeover occurred during context retrieval.
     const generationMode = await readConversationMode(job, businessId, jobId, conversationId);
     if ("outcome" in generationMode) return generationMode.outcome;
-    if (generationMode.mode !== "ai") return cancel(job, businessId, jobId);
+    if (generationMode.mode !== "ai" && generationMode.mode !== "ai_draft") {
+      return cancel(job, businessId, jobId);
+    }
 
     let generatedText: unknown;
     const generationStartedAt = performance.now();

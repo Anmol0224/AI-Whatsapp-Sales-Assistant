@@ -1,16 +1,31 @@
 import mongoose, { type ClientSession, Types } from "mongoose";
 import { randomUUID } from "node:crypto";
+import { env } from "../config/env.js";
 import {
   AiReplyJob,
   type AiReplyJobDocument,
   type AiReplyJobErrorCode,
   type AiReplyJobStatus,
 } from "../models/ai-reply-job.model.js";
-import { Conversation } from "../models/conversation.model.js";
+import { Business } from "../models/business.model.js";
+import { Customer } from "../models/customer.model.js";
+import { Conversation, type ConversationResponseMode } from "../models/conversation.model.js";
 import { Message } from "../models/message.model.js";
+import type { AutomaticReplyEvidenceReference } from "./automatic-reply-safety.service.js";
+import {
+  createAutomaticReplySafetyRepository,
+  createAutomaticReplySafetyService,
+  type AutomaticReplySafetyResult,
+} from "./automatic-reply-safety.service.js";
 
 const DEFAULT_LEASE_DURATION_MS = 60_000;
 const MAX_DRAFT_LENGTH = 4096;
+const AI_DRAFT_RESPONSE_MODES = ["ai", "ai_draft"] as const;
+const AI_RESPONSE_MODES = ["ai", "ai_draft", "ai_automatic"] as const;
+
+function isAiDraftResponseMode(value: unknown): value is (typeof AI_DRAFT_RESPONSE_MODES)[number] {
+  return value === "ai" || value === "ai_draft";
+}
 export const AI_REPLY_JOB_MAX_ATTEMPTS = 3;
 export const AI_REPLY_DRAFT_PAGE_LIMIT = 100;
 
@@ -174,6 +189,16 @@ export interface CreateAiReplyJobInSessionInput {
   session: ClientSession;
 }
 
+export interface CreateAutomaticAiReplyJobInSessionInput {
+  businessId: Types.ObjectId;
+  phoneNumberId: string;
+  conversationId: Types.ObjectId;
+  inboundMessageId: Types.ObjectId;
+  expectedControlVersion: number;
+  globalGateEnabled: boolean;
+  session: ClientSession;
+}
+
 function isDuplicateKeyError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === 11000;
 }
@@ -231,7 +256,7 @@ export async function createAiReplyJobInSession(
   const conversation = await Conversation.findOne({
     _id: input.conversationId,
     businessId: input.businessId,
-    responseMode: "ai",
+    responseMode: { $in: AI_DRAFT_RESPONSE_MODES },
   })
     .select({ _id: 1 })
     .session(input.session)
@@ -288,6 +313,83 @@ export async function createAiReplyJobInSession(
   };
 }
 
+/** Atomically creates one automatic-workflow job only when the opt-in and source fences still hold. */
+export async function createAutomaticAiReplyJobInSession(
+  input: CreateAutomaticAiReplyJobInSessionInput,
+): Promise<{ kind: "created"; jobId: Types.ObjectId; createdAt?: Date } | { kind: "not_eligible" }> {
+  if (!input.globalGateEnabled || !Number.isSafeInteger(input.expectedControlVersion) || input.expectedControlVersion < 0) {
+    return { kind: "not_eligible" };
+  }
+
+  const conversation = await Conversation.findOne({
+    _id: input.conversationId,
+    businessId: input.businessId,
+    responseMode: "ai_automatic",
+    aiControlVersion: input.expectedControlVersion,
+  })
+    .select({ _id: 1, aiControlVersion: 1 })
+    .session(input.session)
+    .lean<{ _id: Types.ObjectId; aiControlVersion: number }>()
+    .exec();
+  if (!conversation) return { kind: "not_eligible" };
+
+  const inboundMessage = await Message.findOne({
+    _id: input.inboundMessageId,
+    businessId: input.businessId,
+    conversationId: input.conversationId,
+    direction: "inbound",
+    messageType: "text",
+  })
+    .select({ _id: 1 })
+    .session(input.session)
+    .lean()
+    .exec();
+  if (!inboundMessage) throw new Error("AI_REPLY_JOB_REFERENCE_NOT_FOUND");
+
+  const existingJob = await AiReplyJob.findOne({
+    businessId: input.businessId,
+    inboundMessageId: input.inboundMessageId,
+  })
+    .select({ _id: 1, conversationId: 1, workflow: 1 })
+    .session(input.session)
+    .lean<{ _id: Types.ObjectId; conversationId: Types.ObjectId; workflow?: string }>()
+    .exec();
+  if (existingJob) {
+    if (!existingJob.conversationId.equals(input.conversationId)) throw new Error("AI_REPLY_JOB_REFERENCE_CONFLICT");
+    // An existing draft job is never converted into an automatic job.
+    return { kind: "not_eligible" };
+  }
+
+  // This write serializes enqueueing with owner opt-out and policy mutations on the same Business document.
+  const business = await Business.findOneAndUpdate(
+    {
+      _id: input.businessId,
+      "whatsapp.phoneNumberId": input.phoneNumberId,
+      "aiSettings.automaticRepliesEnabled": true,
+      "aiSettings.automaticRepliesPolicyVersion": { $type: "string", $regex: /^[A-Za-z0-9._-]{1,64}$/ },
+    },
+    { $inc: { "aiSettings.automaticRepliesControlVersion": 1 } },
+    { session: input.session, returnDocument: "after", runValidators: true },
+  )
+    .select({ "aiSettings.automaticRepliesPolicyVersion": 1 })
+    .lean<{ aiSettings?: { automaticRepliesPolicyVersion?: string } }>()
+    .exec();
+  const policyVersion = business?.aiSettings?.automaticRepliesPolicyVersion;
+  if (!policyVersion || !/^[A-Za-z0-9._-]{1,64}$/.test(policyVersion)) return { kind: "not_eligible" };
+
+  const [job] = await AiReplyJob.create([{
+    businessId: input.businessId,
+    conversationId: input.conversationId,
+    inboundMessageId: input.inboundMessageId,
+    workflow: "ai_automatic",
+    status: "queued",
+    automaticPolicyVersion: policyVersion,
+    workflowControlVersion: input.expectedControlVersion,
+  }], { session: input.session });
+  if (!job) throw new Error("AI_REPLY_JOB_CREATION_FAILED");
+  return { kind: "created", jobId: job._id, ...(job.createdAt ? { createdAt: job.createdAt } : {}) };
+}
+
 /** Atomically claims one due job for this business. attemptCount acts as a fencing token for completion. */
 export async function claimQueuedAiReplyJob(
   businessId: Types.ObjectId,
@@ -296,6 +398,21 @@ export async function claimQueuedAiReplyJob(
   const now = options.now ?? new Date();
   const leaseDurationMs = options.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS;
   if (!isValidLeaseDuration(leaseDurationMs)) throw new Error("INVALID_AI_REPLY_JOB_LEASE_DURATION");
+
+  const automaticReady = await AiReplyJob.findOneAndUpdate(
+    {
+      businessId,
+      workflow: "ai_automatic",
+      status: "automatic_ready",
+      automaticSafetyDecision: "eligible",
+      automaticReplyTextSnapshot: { $type: "string" },
+      nextAttemptAt: { $lte: now },
+      $or: [{ leaseExpiresAt: { $exists: false } }, { leaseExpiresAt: { $lte: now } }],
+    },
+    { $set: { lockedAt: now, leaseExpiresAt: new Date(now.getTime() + leaseDurationMs) } },
+    { sort: { createdAt: 1, _id: 1 }, returnDocument: "after", runValidators: true },
+  ).exec();
+  if (automaticReady) return automaticReady;
 
   return AiReplyJob.findOneAndUpdate(
     {
@@ -324,6 +441,20 @@ export async function claimNextQueuedAiReplyJob(
   const leaseDurationMs = options.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS;
   if (!isValidLeaseDuration(leaseDurationMs)) throw new Error("INVALID_AI_REPLY_JOB_LEASE_DURATION");
 
+  const automaticReady = await AiReplyJob.findOneAndUpdate(
+    {
+      workflow: "ai_automatic",
+      status: "automatic_ready",
+      automaticSafetyDecision: "eligible",
+      automaticReplyTextSnapshot: { $type: "string" },
+      nextAttemptAt: { $lte: now },
+      $or: [{ leaseExpiresAt: { $exists: false } }, { leaseExpiresAt: { $lte: now } }],
+    },
+    { $set: { lockedAt: now, leaseExpiresAt: new Date(now.getTime() + leaseDurationMs) } },
+    { sort: { createdAt: 1, _id: 1 }, returnDocument: "after", runValidators: true },
+  ).exec();
+  if (automaticReady) return automaticReady;
+
   return AiReplyJob.findOneAndUpdate(
     {
       status: "queued",
@@ -346,12 +477,15 @@ export async function claimNextQueuedAiReplyJob(
 export async function findAiReplyConversationMode(
   businessId: Types.ObjectId,
   conversationId: Types.ObjectId,
-): Promise<"human" | "ai" | null> {
+): Promise<"human" | "ai" | "ai_draft" | "ai_automatic" | null> {
   const conversation = await Conversation.findOne({ _id: conversationId, businessId })
     .select({ _id: 1, responseMode: 1 })
-    .lean<{ responseMode?: "human" | "ai" }>()
+    .lean<{ responseMode?: "human" | "ai" | "ai_draft" | "ai_automatic" }>()
     .exec();
-  return conversation?.responseMode === "human" || conversation?.responseMode === "ai"
+  return conversation?.responseMode === "human" ||
+    conversation?.responseMode === "ai" ||
+    conversation?.responseMode === "ai_draft" ||
+    conversation?.responseMode === "ai_automatic"
     ? conversation.responseMode
     : null;
 }
@@ -401,7 +535,7 @@ export async function recoverExpiredAiReplyJobsForWorker(
     throw new Error("INVALID_AI_REPLY_JOB_MAX_ATTEMPTS");
   }
 
-  const [requeued, exhausted] = await Promise.all([
+  const [requeued, exhaustedDrafts, exhaustedAutomatic, releasedAutomaticReady] = await Promise.all([
     AiReplyJob.updateMany(
       { status: "processing", leaseExpiresAt: { $lte: now }, attemptCount: { $lt: maxAttempts } },
       {
@@ -411,16 +545,38 @@ export async function recoverExpiredAiReplyJobsForWorker(
       { runValidators: true },
     ).exec(),
     AiReplyJob.updateMany(
-      { status: "processing", leaseExpiresAt: { $lte: now }, attemptCount: { $gte: maxAttempts } },
+      { status: "processing", workflow: { $ne: "ai_automatic" }, leaseExpiresAt: { $lte: now }, attemptCount: { $gte: maxAttempts } },
       {
         $set: { status: "failed", errorCode: "internal_error" },
         $unset: { lockedAt: 1, leaseExpiresAt: 1 },
       },
       { runValidators: true },
     ).exec(),
+    AiReplyJob.updateMany(
+      { status: "processing", workflow: "ai_automatic", leaseExpiresAt: { $lte: now }, attemptCount: { $gte: maxAttempts } },
+      {
+        $set: {
+          status: "failed",
+          errorCode: "internal_error",
+          automaticSafetyDecision: "uncertain",
+          escalationReason: "provider_generation_failed",
+        },
+        $unset: { lockedAt: 1, leaseExpiresAt: 1 },
+      },
+      { runValidators: true },
+    ).exec(),
+    AiReplyJob.updateMany(
+      {
+        workflow: "ai_automatic",
+        status: "automatic_ready",
+        leaseExpiresAt: { $lte: now },
+      },
+      { $unset: { lockedAt: 1, leaseExpiresAt: 1 } },
+      { runValidators: true },
+    ).exec(),
   ]);
 
-  return requeued.modifiedCount + exhausted.modifiedCount;
+  return requeued.modifiedCount + exhaustedDrafts.modifiedCount + exhaustedAutomatic.modifiedCount + releasedAutomaticReady.modifiedCount;
 }
 
 export type AiReplyDraftPersistenceResult =
@@ -545,7 +701,7 @@ const mongooseDraftTransitions = createAiReplyDraftTransitions({
       {
         _id: conversationId,
         businessId,
-        responseMode: "ai",
+        responseMode: { $in: AI_DRAFT_RESPONSE_MODES },
         ...hasNoActiveSendMarker(),
       },
       { $inc: { aiControlVersion: 1 } },
@@ -584,7 +740,7 @@ const mongooseDraftTransitions = createAiReplyDraftTransitions({
       {
         _id: conversationId,
         businessId,
-        responseMode: "ai",
+        responseMode: { $in: AI_RESPONSE_MODES },
         $or: [
           { activeAiSendJobId: { $exists: false } },
           { activeAiSendJobId: null },
@@ -603,7 +759,10 @@ const mongooseDraftTransitions = createAiReplyDraftTransitions({
 
     const current = await Conversation.findOne({ _id: conversationId, businessId })
       .select({ _id: 1, responseMode: 1, activeAiSendJobId: 1 })
-      .lean<{ responseMode?: "human" | "ai"; activeAiSendJobId?: Types.ObjectId }>()
+      .lean<{
+        responseMode?: "human" | "ai" | "ai_draft" | "ai_automatic";
+        activeAiSendJobId?: Types.ObjectId;
+      }>()
       .exec();
     if (!current) return { kind: "not_found" };
     if (current.activeAiSendJobId) return { kind: "send_in_progress" };
@@ -634,8 +793,8 @@ export async function takeOverConversation(
 }
 
 export type ConversationResponseModeResult =
-  | { kind: "updated"; responseMode: "human" | "ai" }
-  | { kind: "already_set"; responseMode: "human" | "ai" }
+  | { kind: "updated"; responseMode: ConversationResponseMode | "ai" }
+  | { kind: "already_set"; responseMode: ConversationResponseMode | "ai" }
   | { kind: "send_in_progress" }
   | { kind: "conflict" }
   | { kind: "not_found" };
@@ -644,7 +803,7 @@ export type ConversationResponseModeResult =
 export async function setConversationResponseMode(
   businessId: Types.ObjectId,
   conversationId: Types.ObjectId,
-  responseMode: "human" | "ai",
+  responseMode: ConversationResponseMode | "ai",
 ): Promise<ConversationResponseModeResult> {
   if (responseMode === "human") {
     const takeover = await takeOverConversation(businessId, conversationId);
@@ -658,12 +817,18 @@ export async function setConversationResponseMode(
       _id: conversationId,
       businessId,
       $and: [
-        { $or: [{ responseMode: "human" }, { responseMode: { $exists: false } }] },
+        {
+          $or: [
+            { responseMode: { $exists: false } },
+            { responseMode: { $in: ["human", ...AI_RESPONSE_MODES] } },
+          ],
+        },
+        { responseMode: { $ne: responseMode } },
         hasNoActiveSendMarker(),
       ],
     },
     {
-      $set: { responseMode: "ai" },
+      $set: { responseMode },
       $inc: { aiControlVersion: 1 },
     },
     { returnDocument: "after", runValidators: true },
@@ -671,15 +836,18 @@ export async function setConversationResponseMode(
     .select({ _id: 1 })
     .lean()
     .exec();
-  if (conversation) return { kind: "updated", responseMode: "ai" };
+  if (conversation) return { kind: "updated", responseMode };
 
   const current = await Conversation.findOne({ _id: conversationId, businessId })
     .select({ _id: 1, responseMode: 1, activeAiSendJobId: 1 })
-    .lean<{ responseMode?: "human" | "ai"; activeAiSendJobId?: Types.ObjectId }>()
+    .lean<{
+      responseMode?: "human" | "ai" | "ai_draft" | "ai_automatic";
+      activeAiSendJobId?: Types.ObjectId;
+    }>()
     .exec();
   if (!current) return { kind: "not_found" };
   if (current.activeAiSendJobId) return { kind: "send_in_progress" };
-  if (current.responseMode === "ai") return { kind: "already_set", responseMode: "ai" };
+  if (current.responseMode === responseMode) return { kind: "already_set", responseMode };
   return { kind: "conflict" };
 }
 
@@ -697,6 +865,34 @@ export type SendReservationResult =
   | { kind: "not_found" }
   | { kind: "conflict" }
   | { kind: "mode_changed" };
+export type AutomaticSendReservationResult =
+  | {
+      kind: "reserved";
+      sendAttemptId: string;
+      automaticReplyText: string;
+      conversationId: Types.ObjectId;
+      leaseExpiresAt: Date;
+      phoneNumberId: string;
+      connectionStatus: string;
+      recipientPhoneNumber: string;
+    }
+  | {
+      kind: "safety_rejected";
+      validation: AutomaticReplySafetyResult;
+      conversationId: Types.ObjectId;
+      inboundMessageId: Types.ObjectId;
+    }
+  | { kind: "not_found" }
+  | { kind: "already_sent" }
+  | { kind: "in_progress" }
+  | { kind: "ineligible" }
+  | { kind: "not_configured" }
+  | { kind: "conflict" };
+export type AutomaticReplyPersistenceResult =
+  | { kind: "ready"; workflowControlVersion: number }
+  | { kind: "mode_changed" }
+  | { kind: "policy_changed" }
+  | { kind: "stale" };
 export type SendCompletionResult =
   | { kind: "sent"; message: import("../models/message.model.js").MessageDocument }
   | { kind: "already_sent"; outboundMessageId: Types.ObjectId }
@@ -706,6 +902,18 @@ export type SendOutcomeResult = { kind: "recorded" } | { kind: "stale" };
 class AiReplyTransitionAborted extends Error {
   constructor(readonly result: string) {
     super("AI reply transition precondition failed.");
+  }
+}
+
+class AiAutomaticSendTransitionAborted extends Error {
+  constructor(readonly result: "conflict" | "in_progress" | "not_configured") {
+    super("AI automatic-send reservation precondition failed.");
+  }
+}
+
+class AutomaticReplyPersistenceAborted extends Error {
+  constructor(readonly result: "mode_changed" | "policy_changed" | "stale") {
+    super("AI automatic-reply persistence precondition failed.");
   }
 }
 
@@ -721,6 +929,171 @@ async function inTransaction<T>(callback: (session: ClientSession) => Promise<T>
   } finally {
     await session.endSession();
   }
+}
+
+/** Persists only a deterministically validated response and serializes it with opt-out, policy, mode and inbound writes. */
+export async function persistAutomaticAiReply(input: {
+  businessId: Types.ObjectId;
+  conversationId: Types.ObjectId;
+  jobId: Types.ObjectId;
+  inboundMessageId: Types.ObjectId;
+  attemptCount: number;
+  expectedPolicyVersion: string;
+  expectedControlVersion: number;
+  safeReplyText: string;
+  evidence: AutomaticReplyEvidenceReference[];
+  globalGateEnabled: boolean;
+  now?: Date;
+}): Promise<AutomaticReplyPersistenceResult> {
+  const now = input.now ?? new Date();
+  const replyText = input.safeReplyText.trim();
+  if (!input.globalGateEnabled) return { kind: "policy_changed" };
+  if (!replyText || replyText.length > MAX_DRAFT_LENGTH ||
+    !Number.isSafeInteger(input.attemptCount) || input.attemptCount < 1 ||
+    !Number.isSafeInteger(input.expectedControlVersion) || input.expectedControlVersion < 0 ||
+    !/^[A-Za-z0-9._-]{1,64}$/.test(input.expectedPolicyVersion) ||
+    !Array.isArray(input.evidence) || input.evidence.length > 50) {
+    throw new Error("INVALID_AUTOMATIC_AI_REPLY_PERSISTENCE");
+  }
+  const evidence = input.evidence.map((reference) => {
+    if ((reference.kind !== "faq" && reference.kind !== "catalog_item") || !Types.ObjectId.isValid(reference.recordId)) {
+      throw new Error("INVALID_AUTOMATIC_AI_REPLY_EVIDENCE");
+    }
+    return { kind: reference.kind, recordId: new Types.ObjectId(reference.recordId) };
+  });
+
+  try {
+    return await inTransaction(async (session) => {
+      // This write shares the Business fence with owner opt-out and FAQ/catalog policy mutations.
+      const business = await Business.findOneAndUpdate(
+        {
+          _id: input.businessId,
+          "aiSettings.automaticRepliesEnabled": true,
+          "aiSettings.automaticRepliesPolicyVersion": input.expectedPolicyVersion,
+        },
+        { $inc: { "aiSettings.automaticRepliesControlVersion": 1 } },
+        { session, returnDocument: "after", runValidators: true },
+      ).select({ _id: 1 }).lean().exec();
+      if (!business) throw new AutomaticReplyPersistenceAborted("policy_changed");
+
+      const inbound = await Message.findOne({
+        _id: input.inboundMessageId,
+        businessId: input.businessId,
+        conversationId: input.conversationId,
+        direction: "inbound",
+        messageType: "text",
+      }).select({ _id: 1 }).session(session).lean().exec();
+      if (!inbound) throw new AutomaticReplyPersistenceAborted("stale");
+
+      const latestInbound = await Message.findOne({
+        businessId: input.businessId,
+        conversationId: input.conversationId,
+        direction: "inbound",
+        messageType: "text",
+      })
+        .sort({ createdAt: -1, _id: -1 })
+        .select({ _id: 1 })
+        .session(session)
+        .lean<{ _id: Types.ObjectId }>()
+        .exec();
+      if (!latestInbound?._id.equals(input.inboundMessageId)) {
+        throw new AutomaticReplyPersistenceAborted("stale");
+      }
+
+      const conversation = await Conversation.findOneAndUpdate(
+        {
+          _id: input.conversationId,
+          businessId: input.businessId,
+          responseMode: "ai_automatic",
+          aiControlVersion: input.expectedControlVersion,
+          ...hasNoActiveSendMarker(),
+        },
+        { $inc: { aiControlVersion: 1 } },
+        { session, returnDocument: "after", runValidators: true },
+      )
+        .select({ _id: 1, aiControlVersion: 1 })
+        .lean<{ aiControlVersion: number }>()
+        .exec();
+      if (!conversation) {
+        const current = await Conversation.findOne({ _id: input.conversationId, businessId: input.businessId })
+          .select({ responseMode: 1 })
+          .session(session)
+          .lean<{ responseMode?: string }>()
+          .exec();
+        throw new AutomaticReplyPersistenceAborted(current?.responseMode !== "ai_automatic" ? "mode_changed" : "stale");
+      }
+
+      const job = await AiReplyJob.findOneAndUpdate(
+        {
+          _id: input.jobId,
+          businessId: input.businessId,
+          conversationId: input.conversationId,
+          inboundMessageId: input.inboundMessageId,
+          workflow: "ai_automatic",
+          status: "processing",
+          attemptCount: input.attemptCount,
+          leaseExpiresAt: { $gt: now },
+          automaticPolicyVersion: input.expectedPolicyVersion,
+        },
+        {
+          $set: {
+            status: "automatic_ready",
+            automaticSafetyDecision: "eligible",
+            automaticReplyTextSnapshot: replyText,
+            automaticEvidence: evidence,
+            automaticPolicyVersion: input.expectedPolicyVersion,
+            workflowControlVersion: conversation.aiControlVersion,
+          },
+          $unset: { errorCode: 1 },
+        },
+        { session, returnDocument: "after", runValidators: true },
+      ).select({ _id: 1 }).lean().exec();
+      if (!job) throw new AutomaticReplyPersistenceAborted("stale");
+      return { kind: "ready", workflowControlVersion: conversation.aiControlVersion };
+    });
+  } catch (error) {
+    if (error instanceof AutomaticReplyPersistenceAborted) return { kind: error.result };
+    throw error;
+  }
+}
+
+/** Terminalizes an automatic job only while the supplied worker lease still owns it. */
+export async function finishAutomaticAiReplyJob(input: {
+  businessId: Types.ObjectId;
+  jobId: Types.ObjectId;
+  attemptCount: number;
+  leaseExpiresAt: Date;
+  status: "cancelled" | "failed";
+  now?: Date;
+  errorCode?: AiReplyJobErrorCode;
+  automaticSafetyDecision?: "unsupported" | "uncertain";
+  escalationReason?: import("../models/ai-reply-job.model.js").AiReplyEscalationReason;
+  automaticPolicyVersion?: string;
+  workflowControlVersion?: number;
+}): Promise<AiReplyJobDocument | null> {
+  const now = input.now ?? new Date();
+  return AiReplyJob.findOneAndUpdate(
+    {
+      _id: input.jobId,
+      businessId: input.businessId,
+      workflow: "ai_automatic",
+      status: { $in: ["processing", "automatic_ready"] },
+      attemptCount: input.attemptCount,
+      leaseExpiresAt: { $eq: input.leaseExpiresAt, $gt: now },
+    },
+    {
+      $set: {
+        status: input.status,
+        ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+        ...(input.automaticSafetyDecision ? { automaticSafetyDecision: input.automaticSafetyDecision } : {}),
+        ...(input.escalationReason ? { escalationReason: input.escalationReason } : {}),
+        ...(input.automaticPolicyVersion ? { automaticPolicyVersion: input.automaticPolicyVersion } : {}),
+        ...(input.workflowControlVersion === undefined ? {} : { workflowControlVersion: input.workflowControlVersion }),
+      },
+      $unset: { lockedAt: 1, leaseExpiresAt: 1 },
+    },
+    { returnDocument: "after", runValidators: true },
+  ).exec();
 }
 
 function hasNoActiveSendMarker() {
@@ -802,7 +1175,7 @@ export async function approveAiReplyDraft(input: {
         {
           _id: job.conversationId,
           businessId: input.businessId,
-          responseMode: "ai",
+          responseMode: { $in: AI_DRAFT_RESPONSE_MODES },
           aiControlVersion: job.draftControlVersion,
           ...hasNoActiveSendMarker(),
         },
@@ -817,14 +1190,14 @@ export async function approveAiReplyDraft(input: {
           .select({ _id: 1, responseMode: 1, aiControlVersion: 1, activeAiSendJobId: 1 })
           .session(session)
           .lean<{
-            responseMode?: "human" | "ai";
+            responseMode?: "human" | "ai" | "ai_draft" | "ai_automatic";
             aiControlVersion?: number;
             activeAiSendJobId?: Types.ObjectId;
           }>()
           .exec();
         if (!current) throw new AiReplyTransitionAborted("not_found");
         if (current.activeAiSendJobId) throw new AiReplyTransitionAborted("send_in_progress");
-        if (current.responseMode !== "ai") throw new AiReplyTransitionAborted("mode_changed");
+        if (!isAiDraftResponseMode(current.responseMode)) throw new AiReplyTransitionAborted("mode_changed");
         throw new AiReplyTransitionAborted("stale");
       }
 
@@ -920,7 +1293,7 @@ export async function reserveAiReplyDraftForSending(input: {
         {
           _id: job.conversationId,
           businessId: input.businessId,
-          responseMode: "ai",
+          responseMode: { $in: AI_DRAFT_RESPONSE_MODES },
           aiControlVersion: job.approvedControlVersion,
           ...hasNoActiveSendMarker(),
         },
@@ -956,6 +1329,254 @@ export async function reserveAiReplyDraftForSending(input: {
   }
 }
 
+/**
+ * Revalidates an automatic response from transaction-scoped current evidence,
+ * then atomically fences Business and Conversation policy/mode changes while
+ * reserving the job. No provider call is performed in this transaction.
+ */
+export async function reserveAiAutomaticReplyForSending(input: {
+  businessId: Types.ObjectId;
+  jobId: Types.ObjectId;
+  now?: Date;
+  leaseDurationMs?: number;
+  isAutomaticSendEnabled?: () => boolean;
+  workerLease?: { attemptCount: number; leaseExpiresAt: Date };
+}): Promise<AutomaticSendReservationResult> {
+  const now = input.now ?? new Date();
+  const leaseDurationMs = input.leaseDurationMs ?? DEFAULT_LEASE_DURATION_MS;
+  if (!isValidLeaseDuration(leaseDurationMs) || leaseDurationMs > 5 * 60_000) {
+    throw new Error("INVALID_AI_AUTOMATIC_SEND_LEASE_DURATION");
+  }
+  const sendAttemptId = randomUUID();
+  const leaseExpiresAt = new Date(now.getTime() + leaseDurationMs);
+  const isAutomaticSendEnabled = input.isAutomaticSendEnabled ?? (() => env.AI_AUTOMATIC_SEND_ENABLED);
+
+  try {
+    return await inTransaction(async (session) => {
+      const job = await AiReplyJob.findOne({
+        _id: input.jobId,
+        businessId: input.businessId,
+        ...(input.workerLease ? {
+          attemptCount: input.workerLease.attemptCount,
+          leaseExpiresAt: { $eq: input.workerLease.leaseExpiresAt, $gt: now },
+        } : {}),
+      })
+        .select({
+          _id: 1,
+          businessId: 1,
+          conversationId: 1,
+          inboundMessageId: 1,
+          workflow: 1,
+          status: 1,
+          automaticReplyTextSnapshot: 1,
+          automaticSafetyDecision: 1,
+          automaticPolicyVersion: 1,
+          workflowControlVersion: 1,
+          sendProvenance: 1,
+        })
+        .session(session)
+        .lean<{
+          _id: Types.ObjectId;
+          businessId: Types.ObjectId;
+          conversationId: Types.ObjectId;
+          inboundMessageId: Types.ObjectId;
+          workflow?: string;
+          status: string;
+          automaticReplyTextSnapshot?: string;
+          automaticSafetyDecision?: string;
+          automaticPolicyVersion?: string;
+          workflowControlVersion?: number;
+          sendProvenance?: string;
+        }>()
+        .exec();
+      if (!job) return { kind: "not_found" };
+      if (job.workflow !== "ai_automatic") return { kind: "ineligible" };
+      if (job.status === "sent") return { kind: "already_sent" };
+      if (job.status === "sending") return { kind: "in_progress" };
+      if (job.status !== "automatic_ready" || job.sendProvenance ||
+        job.automaticSafetyDecision !== "eligible" ||
+        typeof job.automaticReplyTextSnapshot !== "string" ||
+        typeof job.automaticPolicyVersion !== "string" ||
+        !Number.isSafeInteger(job.workflowControlVersion) || job.workflowControlVersion! < 0) {
+        return { kind: "ineligible" };
+      }
+
+      const safety = createAutomaticReplySafetyService({
+        repository: createAutomaticReplySafetyRepository(session),
+        isAutomaticSendEnabled,
+        transactional: true,
+        // Transaction callbacks can be retried. Emit reservation telemetry only
+        // after commit, outside the callback.
+        log: () => undefined,
+      });
+      const validationInput = {
+        businessId: input.businessId,
+        conversationId: job.conversationId,
+        inboundMessageId: job.inboundMessageId,
+        expectedPolicyVersion: job.automaticPolicyVersion,
+        expectedControlVersion: job.workflowControlVersion!,
+        generatedResponse: job.automaticReplyTextSnapshot,
+      };
+      const validation = await safety.validate(validationInput);
+      if (validation.decision !== "safe_to_auto_reply" || !validation.safeReplyText) {
+        return {
+          kind: "safety_rejected",
+          validation,
+          conversationId: job.conversationId,
+          inboundMessageId: job.inboundMessageId,
+        };
+      }
+
+      const latestInbound = await Message.findOne({
+        businessId: input.businessId,
+        conversationId: job.conversationId,
+        direction: "inbound",
+        messageType: "text",
+      })
+        .sort({ createdAt: -1, _id: -1 })
+        .select({ _id: 1 })
+        .session(session)
+        .lean<{ _id: Types.ObjectId }>()
+        .exec();
+      if (!latestInbound || !latestInbound._id.equals(job.inboundMessageId)) {
+        return {
+          kind: "safety_rejected",
+          validation: {
+            decision: "policy_conflict",
+            reasonCode: "stale_control_version",
+            evidence: validation.evidence,
+            ...(validation.policyVersion ? { policyVersion: validation.policyVersion } : {}),
+            ...(validation.expectedPolicyVersion ? { expectedPolicyVersion: validation.expectedPolicyVersion } : {}),
+            ...(validation.controlVersion === undefined ? {} : { controlVersion: validation.controlVersion }),
+            ...(validation.expectedControlVersion === undefined
+              ? {}
+              : { expectedControlVersion: validation.expectedControlVersion }),
+          },
+          conversationId: job.conversationId,
+          inboundMessageId: job.inboundMessageId,
+        };
+      }
+
+      const currentConversation = await Conversation.findOne({
+        _id: job.conversationId,
+        businessId: input.businessId,
+      })
+        .select({ _id: 1, responseMode: 1, aiControlVersion: 1, activeAiSendJobId: 1 })
+        .session(session)
+        .lean<{
+          responseMode?: string;
+          aiControlVersion?: number;
+          activeAiSendJobId?: Types.ObjectId;
+        }>()
+        .exec();
+      if (!currentConversation) return { kind: "not_found" };
+      if (currentConversation.activeAiSendJobId) return { kind: "in_progress" };
+
+      const alreadyHasOutbound = await Message.exists({
+        businessId: input.businessId,
+        aiReplyJobId: job._id,
+        direction: "outbound",
+      }).session(session);
+      if (alreadyHasOutbound) return { kind: "already_sent" };
+
+      const business = await Business.findOneAndUpdate(
+        {
+          _id: input.businessId,
+          "aiSettings.automaticRepliesEnabled": true,
+          "aiSettings.automaticRepliesPolicyVersion": validation.policyVersion,
+        },
+        { $inc: { "aiSettings.automaticRepliesControlVersion": 1 } },
+        { session, returnDocument: "after", runValidators: true },
+      )
+        .select({ "whatsapp.phoneNumberId": 1, "whatsapp.connectionStatus": 1 })
+        .lean<{ whatsapp?: { phoneNumberId?: string; connectionStatus?: string } }>()
+        .exec();
+      if (!business) throw new AiAutomaticSendTransitionAborted("conflict");
+
+      const phoneNumberId = business.whatsapp?.phoneNumberId;
+      if (typeof phoneNumberId !== "string" || !/^\d{1,32}$/.test(phoneNumberId.trim())) {
+        throw new AiAutomaticSendTransitionAborted("not_configured");
+      }
+
+      const conversation = await Conversation.findOneAndUpdate(
+        {
+          _id: job.conversationId,
+          businessId: input.businessId,
+          responseMode: "ai_automatic",
+          aiControlVersion: validation.expectedControlVersion,
+          ...hasNoActiveSendMarker(),
+        },
+        { $set: { activeAiSendJobId: job._id }, $inc: { aiControlVersion: 1 } },
+        { session, returnDocument: "after", runValidators: true },
+      )
+        .select({ _id: 1, customerId: 1 })
+        .lean<{ customerId: Types.ObjectId }>()
+        .exec();
+      if (!conversation) throw new AiAutomaticSendTransitionAborted("conflict");
+
+      const customer = await Customer.findOne({ _id: conversation.customerId, businessId: input.businessId })
+        .select({ phoneNumber: 1 })
+        .session(session)
+        .lean<{ phoneNumber: string }>()
+        .exec();
+      if (!customer || !/^\+?[1-9]\d{6,14}$/.test(customer.phoneNumber)) {
+        throw new AiAutomaticSendTransitionAborted("not_configured");
+      }
+
+      const jobUpdate = await AiReplyJob.updateOne(
+        {
+          _id: job._id,
+          businessId: input.businessId,
+          conversationId: job.conversationId,
+          inboundMessageId: job.inboundMessageId,
+          workflow: "ai_automatic",
+          status: "automatic_ready",
+          ...(input.workerLease ? {
+            attemptCount: input.workerLease.attemptCount,
+            leaseExpiresAt: { $eq: input.workerLease.leaseExpiresAt, $gt: now },
+          } : {}),
+          automaticSafetyDecision: "eligible",
+          automaticPolicyVersion: validation.expectedPolicyVersion,
+          workflowControlVersion: validation.expectedControlVersion,
+        },
+        {
+          $set: {
+            status: "sending",
+            sendProvenance: "automatic_policy",
+            automaticSafetyDecision: "eligible",
+            automaticReplyTextSnapshot: validation.safeReplyText,
+            automaticPolicyVersion: validation.policyVersion,
+            workflowControlVersion: validation.controlVersion,
+            sendAttemptId,
+            sendStartedAt: now,
+            sendLeaseExpiresAt: leaseExpiresAt,
+          },
+          $unset: { lockedAt: 1, leaseExpiresAt: 1 },
+        },
+        { session, runValidators: true },
+      ).exec();
+      if (jobUpdate.matchedCount !== 1) throw new AiAutomaticSendTransitionAborted("conflict");
+
+      return {
+        kind: "reserved",
+        sendAttemptId,
+        automaticReplyText: validation.safeReplyText,
+        conversationId: job.conversationId,
+        leaseExpiresAt,
+        phoneNumberId: phoneNumberId.trim(),
+        connectionStatus: business.whatsapp?.connectionStatus ?? "configured_not_verified",
+        recipientPhoneNumber: customer.phoneNumber,
+      };
+    });
+  } catch (error) {
+    if (error instanceof AiAutomaticSendTransitionAborted) return { kind: error.result };
+    if (typeof error === "object" && error !== null && "code" in error && error.code === 11000) {
+      return { kind: "in_progress" };
+    }
+    throw error;
+  }
+}
+
 /** Atomically persists a confirmed provider acceptance, outbound Message and conversation summary. */
 export async function completeAiReplySend(input: {
   businessId: Types.ObjectId;
@@ -978,9 +1599,24 @@ export async function completeAiReplySend(input: {
         status: "sending",
         sendAttemptId: input.sendAttemptId,
       })
-        .select({ _id: 1, conversationId: 1, approvedText: 1 })
+        .select({
+          _id: 1,
+          conversationId: 1,
+          workflow: 1,
+          approvedText: 1,
+          automaticReplyTextSnapshot: 1,
+          automaticSafetyDecision: 1,
+          sendProvenance: 1,
+        })
         .session(session)
-        .lean<{ conversationId: Types.ObjectId; approvedText: string }>()
+        .lean<{
+          conversationId: Types.ObjectId;
+          workflow?: string;
+          approvedText?: string;
+          automaticReplyTextSnapshot?: string;
+          automaticSafetyDecision?: string;
+          sendProvenance?: string;
+        }>()
         .exec();
       if (!job) {
         const completed = await AiReplyJob.findOne({
@@ -997,6 +1633,17 @@ export async function completeAiReplySend(input: {
         return completed
           ? { kind: "already_sent", outboundMessageId: completed.outboundMessageId }
           : { kind: "stale" };
+      }
+
+      const messageText = job.sendProvenance === "automatic_policy"
+        ? job.workflow === "ai_automatic" && job.automaticSafetyDecision === "eligible"
+          ? job.automaticReplyTextSnapshot
+          : undefined
+        : job.workflow === undefined || job.workflow === "ai_draft"
+          ? job.approvedText
+          : undefined;
+      if (typeof messageText !== "string" || !messageText.trim() || messageText.length > MAX_DRAFT_LENGTH) {
+        throw new AiReplyTransitionAborted("stale");
       }
 
       const conversation = await Conversation.findOne({
@@ -1017,7 +1664,7 @@ export async function completeAiReplySend(input: {
         aiReplyJobId: input.jobId,
         direction: "outbound",
         messageType: "text",
-        text: job.approvedText,
+        text: messageText,
         providerMessageId,
         status: "sent",
         timestamp: now,
@@ -1030,7 +1677,7 @@ export async function completeAiReplySend(input: {
           ...activeSendReservationFilter(input.jobId),
         },
         {
-          $set: { lastMessageAt: now, lastMessagePreview: job.approvedText.slice(0, 280) },
+          $set: { lastMessageAt: now, lastMessagePreview: messageText.slice(0, 280) },
           $unset: { activeAiSendJobId: 1 },
           $inc: { aiControlVersion: 1 },
         },

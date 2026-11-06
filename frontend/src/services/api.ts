@@ -64,12 +64,58 @@ export type BusinessProfileUpdate = {
   timezone?: string
 }
 
-export type BusinessWhatsAppConnectionStatus = 'not_configured' | 'configured_not_verified'
+export type BusinessAiSettings = {
+  automaticRepliesEnabled: boolean
+  automaticRepliesEnabledAt?: string
+  automaticRepliesDisabledAt?: string
+  automaticRepliesPolicyVersion?: string
+}
+
+export type BusinessAiSettingsResponse = {
+  success: true
+  aiSettings: BusinessAiSettings
+  automaticSendAvailable: boolean
+}
+
+export type BusinessAiSettingsUpdateResponse = BusinessAiSettingsResponse & {
+  message: string
+}
+
+export type BusinessAiSettingsUpdate = {
+  automaticRepliesEnabled: boolean
+}
+
+export type BusinessWhatsAppConnectionStatus =
+  | 'not_configured'
+  | 'configured_not_verified'
+  | 'verification_pending'
+  | 'verified'
+  | 'verification_failed'
+
+export type BusinessWhatsAppVerificationFailureCategory =
+  | 'missing_access_token'
+  | 'missing_graph_api_version'
+  | 'invalid_phone_number_id'
+  | 'provider_authentication_failed'
+  | 'missing_permissions'
+  | 'invalid_phone_number_id_at_provider'
+  | 'provider_rate_limited'
+  | 'provider_timeout'
+  | 'provider_network_error'
+  | 'provider_unavailable'
+  | 'unexpected_provider_response'
+  | 'phone_number_id_mismatch'
 
 export type BusinessWhatsAppSettings = {
   phoneNumberId?: string
   displayNumber?: string
   connectionStatus: BusinessWhatsAppConnectionStatus
+  verifiedPhoneNumberId?: string
+  lastVerificationAt?: string
+  verificationFailureCategory?: BusinessWhatsAppVerificationFailureCategory
+  verifiedDisplayNumber?: string
+  verifiedName?: string
+  qualityRating?: 'GREEN' | 'YELLOW' | 'RED' | 'UNKNOWN'
 }
 
 export type BusinessWhatsAppSettingsResponse = {
@@ -80,6 +126,12 @@ export type BusinessWhatsAppSettingsResponse = {
 export type BusinessWhatsAppSettingsUpdate = {
   phoneNumberId: string
   displayNumber?: string
+}
+
+export type BusinessWhatsAppVerificationResponse = {
+  success: true
+  message: string
+  whatsapp: BusinessWhatsAppSettings
 }
 
 export type CatalogItemKind = 'product' | 'service'
@@ -301,7 +353,121 @@ export type AiDraftFilters = {
   status?: AiReplyDraftStatus
 }
 
-export type ConversationResponseMode = 'human' | 'ai'
+export type AiReplyEscalationCategory =
+  | 'needs_owner_review'
+  | 'unsupported_information'
+  | 'ambiguous_request'
+  | 'missing_business_information'
+  | 'policy_conflict'
+  | 'invalid_or_empty_response'
+
+export type AiReplyEscalationReasonCode =
+  | 'automatic_replies_disabled'
+  | 'source_message_unavailable'
+  | 'conversation_mode_mismatch'
+  | 'stale_control_version'
+  | 'stale_policy_version'
+  | 'business_evidence_unavailable'
+  | 'evidence_incomplete'
+  | 'faq_not_exact'
+  | 'faq_answers_conflict'
+  | 'catalog_intent_unsupported'
+  | 'catalog_item_missing'
+  | 'catalog_item_ambiguous'
+  | 'catalog_price_missing'
+  | 'faq_exact_answer'
+  | 'catalog_price_response'
+  | 'catalog_listing_response'
+  | 'generated_response_mismatch'
+  | 'generated_response_invalid'
+  | 'provider_generation_failed'
+  | 'validation_failed'
+
+export type AiReplyEscalationStatus = 'open' | 'resolved' | 'dismissed'
+export type AiReplyEscalationStatusFilter = AiReplyEscalationStatus | 'all'
+export type AiReplyEscalationResolutionOutcome = 'resolved' | 'dismissed'
+
+export type AiEscalationConversation = {
+  id: string
+  status: 'open' | 'closed'
+  customer: {
+    profileName?: string
+    phoneNumber?: string
+  } | null
+}
+
+export type AiEscalationInboundMessage = {
+  id: string
+  text: string
+  timestamp?: string
+  createdAt: string
+}
+
+export type AiEscalationEvidence = {
+  kind: 'faq' | 'catalog_item'
+  recordId: string
+  label?: string
+}
+
+export type AiReplyEscalation = {
+  id: string
+  conversationId: string
+  conversation: AiEscalationConversation | null
+  inboundMessage: AiEscalationInboundMessage | null
+  category: AiReplyEscalationCategory
+  reasonCode: AiReplyEscalationReasonCode
+  policyVersion?: string
+  expectedPolicyVersion?: string
+  controlVersion?: number
+  expectedControlVersion?: number
+  status: AiReplyEscalationStatus
+  resolvedAt?: string
+  resolutionNote?: string
+  createdAt: string
+  updatedAt: string
+}
+
+export type AiReplyEscalationDetail = AiReplyEscalation & {
+  evidence: AiEscalationEvidence[]
+}
+
+export type AiEscalationCounts = {
+  pending: number
+  resolved: number
+  dismissed: number
+  total: number
+}
+
+export type AiEscalationsResponse = {
+  success: true
+  escalations: AiReplyEscalation[]
+  counts: AiEscalationCounts
+  pagination: CatalogPagination
+}
+
+export type AiEscalationResponse = {
+  success: true
+  escalation: AiReplyEscalationDetail
+}
+
+export type AiEscalationResolutionResponse = {
+  success: true
+  message: string
+  escalation: {
+    id: string
+    status: AiReplyEscalationResolutionOutcome
+    resolvedAt: string
+    resolutionNote?: string
+  }
+}
+
+export type AiEscalationFilters = {
+  page?: number
+  limit?: number
+  status?: AiReplyEscalationStatusFilter
+}
+
+export type ConversationResponseMode = 'human' | 'ai' | 'ai_draft' | 'ai_automatic'
 
 export type ConversationResponseModeResponse = {
   success: true
@@ -428,13 +594,61 @@ function isBusinessProfileResponse(value: unknown): value is BusinessProfileResp
   return isRecord(value) && value.success === true && isBusinessProfile(value.business)
 }
 
+function isBusinessAiSettings(value: unknown): value is BusinessAiSettings {
+  return (
+    isRecord(value) &&
+    typeof value.automaticRepliesEnabled === 'boolean' &&
+    (value.automaticRepliesEnabledAt === undefined || isDateString(value.automaticRepliesEnabledAt)) &&
+    (value.automaticRepliesDisabledAt === undefined || isDateString(value.automaticRepliesDisabledAt)) &&
+    (value.automaticRepliesPolicyVersion === undefined || typeof value.automaticRepliesPolicyVersion === 'string')
+  )
+}
+
+function isBusinessAiSettingsResponse(value: unknown): value is BusinessAiSettingsResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    isBusinessAiSettings(value.aiSettings) &&
+    typeof value.automaticSendAvailable === 'boolean'
+  )
+}
+
+function isBusinessAiSettingsUpdateResponse(value: unknown): value is BusinessAiSettingsUpdateResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    isBusinessAiSettings(value.aiSettings) &&
+    typeof value.automaticSendAvailable === 'boolean' &&
+    typeof value.message === 'string'
+  )
+}
+
 function isBusinessWhatsAppSettings(value: unknown): value is BusinessWhatsAppSettings {
   return (
     isRecord(value) &&
     (value.phoneNumberId === undefined || typeof value.phoneNumberId === 'string') &&
     (value.displayNumber === undefined || typeof value.displayNumber === 'string') &&
-    (value.connectionStatus === 'not_configured' || value.connectionStatus === 'configured_not_verified')
+    (value.connectionStatus === 'not_configured' ||
+      value.connectionStatus === 'configured_not_verified' ||
+      value.connectionStatus === 'verification_pending' ||
+      value.connectionStatus === 'verified' ||
+      value.connectionStatus === 'verification_failed') &&
+    (value.verifiedPhoneNumberId === undefined || typeof value.verifiedPhoneNumberId === 'string') &&
+    (value.lastVerificationAt === undefined || isDateString(value.lastVerificationAt)) &&
+    (value.verificationFailureCategory === undefined || isBusinessWhatsAppVerificationFailureCategory(value.verificationFailureCategory)) &&
+    (value.verifiedDisplayNumber === undefined || typeof value.verifiedDisplayNumber === 'string') &&
+    (value.verifiedName === undefined || typeof value.verifiedName === 'string') &&
+    (value.qualityRating === undefined || ['GREEN', 'YELLOW', 'RED', 'UNKNOWN'].includes(String(value.qualityRating)))
   )
+}
+
+function isBusinessWhatsAppVerificationFailureCategory(value: unknown): value is BusinessWhatsAppVerificationFailureCategory {
+  return [
+    'missing_access_token', 'missing_graph_api_version', 'invalid_phone_number_id',
+    'provider_authentication_failed', 'missing_permissions', 'invalid_phone_number_id_at_provider',
+    'provider_rate_limited', 'provider_timeout', 'provider_network_error', 'provider_unavailable',
+    'unexpected_provider_response', 'phone_number_id_mismatch',
+  ].includes(String(value))
 }
 
 function isBusinessWhatsAppSettingsResponse(value: unknown): value is BusinessWhatsAppSettingsResponse {
@@ -723,7 +937,7 @@ function isConversationResponseModeResponse(value: unknown): value is Conversati
     typeof value.message === 'string' &&
     isRecord(value.conversation) &&
     typeof value.conversation.id === 'string' &&
-    (value.conversation.responseMode === 'human' || value.conversation.responseMode === 'ai')
+    isConversationResponseMode(value.conversation.responseMode)
   )
 }
 
@@ -733,7 +947,157 @@ function isConversationResponseModeGetResponse(value: unknown): value is Convers
     value.success === true &&
     isRecord(value.conversation) &&
     typeof value.conversation.id === 'string' &&
-    (value.conversation.responseMode === 'human' || value.conversation.responseMode === 'ai')
+    isConversationResponseMode(value.conversation.responseMode)
+  )
+}
+
+function isConversationResponseMode(value: unknown): value is ConversationResponseMode {
+  return value === 'human' || value === 'ai' || value === 'ai_draft' || value === 'ai_automatic'
+}
+
+const aiReplyEscalationCategories: readonly AiReplyEscalationCategory[] = [
+  'needs_owner_review',
+  'unsupported_information',
+  'ambiguous_request',
+  'missing_business_information',
+  'policy_conflict',
+  'invalid_or_empty_response',
+]
+
+const aiReplyEscalationReasonCodes: readonly AiReplyEscalationReasonCode[] = [
+  'automatic_replies_disabled',
+  'source_message_unavailable',
+  'conversation_mode_mismatch',
+  'stale_control_version',
+  'stale_policy_version',
+  'business_evidence_unavailable',
+  'evidence_incomplete',
+  'faq_not_exact',
+  'faq_answers_conflict',
+  'catalog_intent_unsupported',
+  'catalog_item_missing',
+  'catalog_item_ambiguous',
+  'catalog_price_missing',
+  'faq_exact_answer',
+  'catalog_price_response',
+  'catalog_listing_response',
+  'generated_response_mismatch',
+  'generated_response_invalid',
+  'provider_generation_failed',
+  'validation_failed',
+]
+
+const aiReplyEscalationStatuses: readonly AiReplyEscalationStatus[] = ['open', 'resolved', 'dismissed']
+
+function isAiEscalationConversation(value: unknown): value is AiEscalationConversation {
+  if (
+    !isRecord(value) ||
+    typeof value.id !== 'string' ||
+    (value.status !== 'open' && value.status !== 'closed')
+  ) {
+    return false
+  }
+  if (value.customer === null) return true
+  return (
+    isRecord(value.customer) &&
+    (value.customer.profileName === undefined || typeof value.customer.profileName === 'string') &&
+    (value.customer.phoneNumber === undefined || typeof value.customer.phoneNumber === 'string')
+  )
+}
+
+function isAiEscalationInboundMessage(value: unknown): value is AiEscalationInboundMessage {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.text === 'string' &&
+    (value.timestamp === undefined || isDateString(value.timestamp)) &&
+    isDateString(value.createdAt)
+  )
+}
+
+function isAiEscalationEvidence(value: unknown): value is AiEscalationEvidence {
+  return (
+    isRecord(value) &&
+    (value.kind === 'faq' || value.kind === 'catalog_item') &&
+    typeof value.recordId === 'string' &&
+    (value.label === undefined || typeof value.label === 'string')
+  )
+}
+
+function isOptionalNonNegativeInt(value: unknown): boolean {
+  return value === undefined || (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0)
+}
+
+function isAiReplyEscalation(value: unknown): value is AiReplyEscalation {
+  return (
+    isRecord(value) &&
+    typeof value.id === 'string' &&
+    typeof value.conversationId === 'string' &&
+    (value.conversation === null || isAiEscalationConversation(value.conversation)) &&
+    (value.inboundMessage === null || isAiEscalationInboundMessage(value.inboundMessage)) &&
+    aiReplyEscalationCategories.includes(value.category as AiReplyEscalationCategory) &&
+    aiReplyEscalationReasonCodes.includes(value.reasonCode as AiReplyEscalationReasonCode) &&
+    (value.policyVersion === undefined || typeof value.policyVersion === 'string') &&
+    (value.expectedPolicyVersion === undefined || typeof value.expectedPolicyVersion === 'string') &&
+    isOptionalNonNegativeInt(value.controlVersion) &&
+    isOptionalNonNegativeInt(value.expectedControlVersion) &&
+    aiReplyEscalationStatuses.includes(value.status as AiReplyEscalationStatus) &&
+    (value.resolvedAt === undefined || isDateString(value.resolvedAt)) &&
+    (value.resolutionNote === undefined || typeof value.resolutionNote === 'string') &&
+    isDateString(value.createdAt) &&
+    isDateString(value.updatedAt)
+  )
+}
+
+function isAiReplyEscalationDetail(value: unknown): value is AiReplyEscalationDetail {
+  if (!isAiReplyEscalation(value)) return false
+  const candidate = value as Record<string, unknown>
+  return Array.isArray(candidate.evidence) && candidate.evidence.every(isAiEscalationEvidence)
+}
+
+function isAiEscalationCounts(value: unknown): value is AiEscalationCounts {
+  return (
+    isRecord(value) &&
+    typeof value.pending === 'number' &&
+    Number.isSafeInteger(value.pending) &&
+    value.pending >= 0 &&
+    typeof value.resolved === 'number' &&
+    Number.isSafeInteger(value.resolved) &&
+    value.resolved >= 0 &&
+    typeof value.dismissed === 'number' &&
+    Number.isSafeInteger(value.dismissed) &&
+    value.dismissed >= 0 &&
+    typeof value.total === 'number' &&
+    Number.isSafeInteger(value.total) &&
+    value.total >= 0
+  )
+}
+
+function isAiEscalationsResponse(value: unknown): value is AiEscalationsResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    Array.isArray(value.escalations) &&
+    value.escalations.every(isAiReplyEscalation) &&
+    isAiEscalationCounts(value.counts) &&
+    isCatalogPagination(value.pagination)
+  )
+}
+
+function isAiEscalationResponse(value: unknown): value is AiEscalationResponse {
+  return isRecord(value) && value.success === true && isAiReplyEscalationDetail(value.escalation)
+}
+
+function isAiEscalationResolutionResponse(value: unknown): value is AiEscalationResolutionResponse {
+  return (
+    isRecord(value) &&
+    value.success === true &&
+    typeof value.message === 'string' &&
+    isRecord(value.escalation) &&
+    typeof value.escalation.id === 'string' &&
+    (value.escalation.status === 'resolved' || value.escalation.status === 'dismissed') &&
+    isDateString(value.escalation.resolvedAt) &&
+    (value.escalation.resolutionNote === undefined || typeof value.escalation.resolutionNote === 'string')
   )
 }
 
@@ -843,6 +1207,21 @@ export function getBusinessProfile(): Promise<BusinessProfileResponse> {
   return requestJson('/business', isBusinessProfileResponse, {}, true)
 }
 
+export function getBusinessAiSettings(): Promise<BusinessAiSettingsResponse> {
+  return requestJson('/business/ai-settings', isBusinessAiSettingsResponse, {}, true)
+}
+
+export function updateBusinessAiSettings(
+  data: BusinessAiSettingsUpdate,
+): Promise<BusinessAiSettingsUpdateResponse> {
+  return requestJson(
+    '/business/ai-settings',
+    isBusinessAiSettingsUpdateResponse,
+    { method: 'PATCH', body: JSON.stringify(data) },
+    true,
+  )
+}
+
 export function updateBusinessProfile(
   data: BusinessProfileUpdate,
 ): Promise<BusinessProfileResponse> {
@@ -865,6 +1244,16 @@ export function updateBusinessWhatsAppSettings(
     '/business/whatsapp',
     isBusinessWhatsAppSettingsResponse,
     { method: 'PATCH', body: JSON.stringify(data) },
+    true,
+  )
+}
+
+export function verifyBusinessWhatsAppSettings(): Promise<BusinessWhatsAppVerificationResponse> {
+  return requestJson(
+    '/business/whatsapp/verify',
+    (value): value is BusinessWhatsAppVerificationResponse =>
+      isRecord(value) && value.success === true && typeof value.message === 'string' && isBusinessWhatsAppSettings(value.whatsapp),
+    { method: 'POST', body: JSON.stringify({}) },
     true,
   )
 }
@@ -1066,6 +1455,38 @@ export function getConversationResponseMode(
     `/conversations/${encodeURIComponent(conversationId)}/response-mode`,
     isConversationResponseModeGetResponse,
     {},
+    true,
+  )
+}
+
+export function getAiEscalations(filters: AiEscalationFilters = {}): Promise<AiEscalationsResponse> {
+  const path = buildQuery('/ai-escalations', {
+    page: filters.page,
+    limit: filters.limit,
+    status: filters.status,
+  })
+  return requestJson(path, isAiEscalationsResponse, {}, true)
+}
+
+export function getAiEscalation(id: string): Promise<AiEscalationResponse> {
+  return requestJson(`/ai-escalations/${encodeURIComponent(id)}`, isAiEscalationResponse, {}, true)
+}
+
+export function resolveAiEscalation(
+  id: string,
+  input: { outcome?: AiReplyEscalationResolutionOutcome; note?: string } = {},
+): Promise<AiEscalationResolutionResponse> {
+  const note = input.note?.trim()
+  return requestJson(
+    `/ai-escalations/${encodeURIComponent(id)}/resolve`,
+    isAiEscalationResolutionResponse,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        ...(input.outcome ? { outcome: input.outcome } : {}),
+        ...(note ? { note } : {}),
+      }),
+    },
     true,
   )
 }

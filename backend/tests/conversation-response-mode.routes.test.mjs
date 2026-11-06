@@ -9,7 +9,12 @@ const businessId = new Types.ObjectId()
 const userId = new Types.ObjectId()
 const conversationId = new Types.ObjectId()
 
-async function withServer(changeResponseMode, run, readResponseMode = async () => ({ responseMode: 'ai' })) {
+async function withServer(
+  changeResponseMode,
+  run,
+  readResponseMode = async () => ({ responseMode: 'ai' }),
+  options = {},
+) {
   const calls = []
   const dependencies = {
     async listConversations() { return { items: [], totalItems: 0 } },
@@ -21,6 +26,11 @@ async function withServer(changeResponseMode, run, readResponseMode = async () =
       calls.push({ operation: 'get', businessId: ownerBusinessId, conversationId: id })
       return readResponseMode(id, ownerBusinessId)
     },
+    async automaticRepliesEnabled(ownerBusinessId, ownerId) {
+      calls.push({ operation: 'automaticRepliesEnabled', businessId: ownerBusinessId, userId: ownerId })
+      return options.businessOptIn === true
+    },
+    isAutomaticSendEnabled() { return options.globalEnabled === true },
     async sendText() { throw new Error('not called') },
     async createMessage() { throw new Error('not called') },
     async findMessageByProviderId() { return null },
@@ -45,7 +55,7 @@ async function withServer(changeResponseMode, run, readResponseMode = async () =
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
   const address = server.address()
   try {
-    await run(`http://127.0.0.1:${address.port}`, calls)
+  await run(`http://127.0.0.1:${address.port}`, calls)
   } finally {
     await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
   }
@@ -124,7 +134,55 @@ test('response-mode endpoint validates owner request and scopes conversation by 
       responseMode: 'ai', businessId: new Types.ObjectId().toString(),
     })
     assert.equal(unknownField.response.status, 400)
+
+    for (const mode of ['ai_draft', 'ai']) {
+      const compatible = await patch(baseUrl, `/conversations/${conversationId}/response-mode`, { responseMode: mode })
+      assert.equal(compatible.response.status, 200)
+      assert.equal(compatible.body.conversation.responseMode, mode)
+    }
   })
+})
+
+test('automatic mode requires both the global gate and business owner opt-in', async () => {
+  let modeChangeCalls = 0
+  await withServer((mode) => {
+    modeChangeCalls += 1
+    return { kind: 'updated', responseMode: mode }
+  }, async (baseUrl, calls) => {
+    const globalOff = await patch(baseUrl, `/conversations/${conversationId}/response-mode`, {
+      responseMode: 'ai_automatic',
+    })
+    assert.equal(globalOff.response.status, 409)
+    assert.equal(globalOff.body.code, 'automatic_send_disabled')
+    assert.equal(modeChangeCalls, 0)
+    assert.equal(calls.length, 0)
+  })
+
+  await withServer((mode) => {
+    modeChangeCalls += 1
+    return { kind: 'updated', responseMode: mode }
+  }, async (baseUrl, calls) => {
+    const businessOff = await patch(baseUrl, `/conversations/${conversationId}/response-mode`, {
+      responseMode: 'ai_automatic',
+    })
+    assert.equal(businessOff.response.status, 409)
+    assert.equal(businessOff.body.code, 'business_automatic_replies_disabled')
+    assert.equal(calls[0].operation, 'automaticRepliesEnabled')
+    assert.equal(calls[0].businessId.toString(), businessId.toString())
+    assert.equal(calls[0].userId.toString(), userId.toString())
+    assert.equal(modeChangeCalls, 0)
+  }, async () => ({ responseMode: 'human' }), { globalEnabled: true, businessOptIn: false })
+})
+
+test('automatic mode is accepted only after global gate and owner-scoped business opt-in pass', async () => {
+  await withServer((mode) => ({ kind: 'updated', responseMode: mode }), async (baseUrl, calls) => {
+    const result = await patch(baseUrl, `/conversations/${conversationId}/response-mode`, {
+      responseMode: 'ai_automatic',
+    })
+    assert.equal(result.response.status, 200)
+    assert.equal(result.body.conversation.responseMode, 'ai_automatic')
+    assert.equal(calls[0].operation, 'automaticRepliesEnabled')
+  }, async () => ({ responseMode: 'human' }), { globalEnabled: true, businessOptIn: true })
 })
 
 test('active reservation returns conflict and AI resume reports the resulting mode', async () => {

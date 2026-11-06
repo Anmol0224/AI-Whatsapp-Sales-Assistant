@@ -53,6 +53,7 @@ async function withMongoModelMocks(run, options = {}) {
     startSession: mongoose.startSession,
     businessFind: Business.find,
     businessFindOne: Business.findOne,
+    businessFindOneAndUpdate: Business.findOneAndUpdate,
     customerFindOneAndUpdate: Customer.findOneAndUpdate,
     conversationFindOneAndUpdate: Conversation.findOneAndUpdate,
     conversationFindOne: Conversation.findOne,
@@ -69,6 +70,14 @@ async function withMongoModelMocks(run, options = {}) {
     jobs: [],
     sessionsEnded: 0,
     transactionCommitted: false,
+    business: {
+      _id: businessId,
+      aiSettings: {
+        automaticRepliesEnabled: options.businessAutomaticRepliesEnabled ?? false,
+        automaticRepliesPolicyVersion: options.automaticRepliesPolicyVersion ?? 'test-policy',
+        automaticRepliesControlVersion: 0,
+      },
+    },
   }
 
   mongoose.startSession = async () => ({
@@ -84,13 +93,23 @@ async function withMongoModelMocks(run, options = {}) {
         state.messages = snapshot.messages
         state.jobs = snapshot.jobs
         state.transactionCommitted = snapshot.transactionCommitted
+        state.business = snapshot.business
         throw error
       }
     },
     async endSession() { state.sessionsEnded += 1 },
   })
   Business.find = () => makeQuery(() => [{ _id: businessId }])
-  Business.findOne = () => makeQuery(() => ({ _id: businessId }))
+  Business.findOne = () => makeQuery(() => state.business)
+  Business.findOneAndUpdate = (filter, update) => makeQuery(() => {
+    if (filter._id?.toString() !== businessId.toString() ||
+      filter['whatsapp.phoneNumberId'] !== phoneNumberId ||
+      filter['aiSettings.automaticRepliesEnabled'] !== state.business.aiSettings.automaticRepliesEnabled ||
+      !/^[A-Za-z0-9._-]{1,64}$/.test(state.business.aiSettings.automaticRepliesPolicyVersion) ||
+      state.business.aiSettings.automaticRepliesEnabled !== true) return null
+    state.business.aiSettings.automaticRepliesControlVersion += update.$inc['aiSettings.automaticRepliesControlVersion']
+    return state.business
+  })
   Customer.findOneAndUpdate = () => makeQuery(() => {
     state.customer ??= { _id: customerId, businessId, phoneNumber: '919876543210' }
     return { ...state.customer }
@@ -104,13 +123,18 @@ async function withMongoModelMocks(run, options = {}) {
       aiControlVersion: 0,
     }
     state.conversation.responseMode = options.responseMode ?? 'ai'
+    if (state.conversation.aiControlVersion === undefined) state.conversation.aiControlVersion = 0
     return { ...state.conversation }
   })
   Conversation.findOne = (filter) => makeQuery(() => {
     if (!state.conversation || filter._id.toString() !== state.conversation._id.toString() ||
       filter.businessId.toString() !== businessId.toString() ||
-      (filter.responseMode && filter.responseMode !== state.conversation.responseMode)) return null
-    return { _id: state.conversation._id }
+      (filter.responseMode && (
+        typeof filter.responseMode === 'object'
+          ? !filter.responseMode.$in?.includes(state.conversation.responseMode)
+          : filter.responseMode !== state.conversation.responseMode
+      ))) return null
+    return { ...state.conversation }
   })
   Conversation.updateOne = (filter, update) => makeQuery(() => {
     if (!state.conversation || filter._id.toString() !== state.conversation._id.toString() ||
@@ -158,6 +182,7 @@ async function withMongoModelMocks(run, options = {}) {
     mongoose.startSession = originals.startSession
     Business.find = originals.businessFind
     Business.findOne = originals.businessFindOne
+    Business.findOneAndUpdate = originals.businessFindOneAndUpdate
     Customer.findOneAndUpdate = originals.customerFindOneAndUpdate
     Conversation.findOneAndUpdate = originals.conversationFindOneAndUpdate
     Conversation.findOne = originals.conversationFindOne
@@ -200,6 +225,7 @@ test('AI mode plus enabled worker creates one queued job inside inbound persiste
   await withMongoModelMocks(async (state) => {
     const result = await ingestWhatsAppPayload(payload('wamid.ai-enabled'), undefined, {
       aiDraftWorkerEnabled: true,
+      aiAutomaticSendEnabled: true,
     })
     assert.deepEqual(result, { kind: 'accepted', inserted: 1, duplicates: 0 })
     assert.equal(state.messages.length, 1)
@@ -209,7 +235,74 @@ test('AI mode plus enabled worker creates one queued job inside inbound persiste
     assert.equal(state.jobs[0].conversationId.toString(), conversationId.toString())
     assert.equal(state.jobs[0].inboundMessageId.toString(), state.messages[0]._id.toString())
     assert.equal(state.conversation.aiControlVersion, 1)
-  })
+  }, { businessAutomaticRepliesEnabled: true })
+})
+
+test('ai_draft mode uses the existing draft enqueue path and never creates an automatic workflow', async () => {
+  await withMongoModelMocks(async (state) => {
+    const result = await ingestWhatsAppPayload(payload('wamid.ai-draft-mode'), undefined, {
+      aiDraftWorkerEnabled: true,
+      aiAutomaticSendEnabled: true,
+    })
+    assert.deepEqual(result, { kind: 'accepted', inserted: 1, duplicates: 0 })
+    assert.equal(state.jobs.length, 1)
+    assert.equal(state.jobs[0].status, 'queued')
+    assert.equal(state.jobs[0].workflow, undefined)
+    assert.equal(state.conversation.responseMode, 'ai_draft')
+  }, { responseMode: 'ai_draft', businessAutomaticRepliesEnabled: true })
+})
+
+test('ai_automatic with the global gate disabled persists inbound without enqueueing', async () => {
+  await withMongoModelMocks(async (state) => {
+    const result = await ingestWhatsAppPayload(payload('wamid.ai-automatic-foundation'), undefined, {
+      aiDraftWorkerEnabled: true,
+      aiAutomaticSendEnabled: false,
+    })
+    assert.deepEqual(result, { kind: 'accepted', inserted: 1, duplicates: 0 })
+    assert.equal(state.messages.length, 1)
+    assert.equal(state.jobs.length, 0)
+  }, { responseMode: 'ai_automatic' })
+})
+
+test('eligible ai_automatic message creates one atomic automatic workflow job', async () => {
+  await withMongoModelMocks(async (state) => {
+    await ingestWhatsAppPayload(payload('wamid.ai-automatic-eligible'), undefined, {
+      aiDraftWorkerEnabled: false,
+      aiAutomaticSendEnabled: true,
+    })
+    assert.equal(state.messages.length, 1)
+    assert.equal(state.jobs.length, 1)
+    assert.equal(state.jobs[0].workflow, 'ai_automatic')
+    assert.equal(state.jobs[0].status, 'queued')
+    assert.equal(state.jobs[0].automaticPolicyVersion, 'test-policy')
+    assert.equal(state.jobs[0].workflowControlVersion, 1)
+    assert.equal(state.jobs[0].automaticSafetyDecision, undefined)
+    assert.equal(state.conversation.aiControlVersion, 1)
+  }, { responseMode: 'ai_automatic', businessAutomaticRepliesEnabled: true })
+})
+
+test('ai_automatic with business opt-in disabled does not enqueue', async () => {
+  await withMongoModelMocks(async (state) => {
+    await ingestWhatsAppPayload(payload('wamid.ai-automatic-optout'), undefined, {
+      aiAutomaticSendEnabled: true,
+    })
+    assert.equal(state.messages.length, 1)
+    assert.equal(state.jobs.length, 0)
+    assert.equal(state.conversation.aiControlVersion, 1)
+  }, { responseMode: 'ai_automatic', businessAutomaticRepliesEnabled: false })
+})
+
+test('duplicate automatic webhook delivery creates one message, one job and one fence increment', async () => {
+  await withMongoModelMocks(async (state) => {
+    const options = { aiAutomaticSendEnabled: true }
+    await ingestWhatsAppPayload(payload('wamid.ai-automatic-duplicate'), undefined, options)
+    await ingestWhatsAppPayload(payload('wamid.ai-automatic-duplicate'), undefined, options)
+    assert.equal(state.messages.length, 1)
+    assert.equal(state.jobs.length, 1)
+    assert.equal(state.jobs[0].workflow, 'ai_automatic')
+    assert.equal(state.conversation.aiControlVersion, 1)
+    assert.equal(state.business.aiSettings.automaticRepliesControlVersion, 1)
+  }, { responseMode: 'ai_automatic', businessAutomaticRepliesEnabled: true })
 })
 
 test('eligible job wake is emitted only after its inbound transaction commits', async () => {
@@ -288,6 +381,22 @@ test('job insertion failure rolls back customer, conversation, message and fence
     unsubscribe()
   }
   assert.equal(wakeCount, 0)
+})
+
+test('automatic job insertion failure rolls back inbound message, both fences, and transaction-created customer/conversation', async () => {
+  await withMongoModelMocks(async (state) => {
+    await assert.rejects(ingestWhatsAppPayload(
+      payload('wamid.auto-job-failure'),
+      undefined,
+      { aiAutomaticSendEnabled: true },
+    ))
+    assert.equal(state.customer, null)
+    assert.equal(state.conversation, null)
+    assert.equal(state.messages.length, 0)
+    assert.equal(state.jobs.length, 0)
+    assert.equal(state.business.aiSettings.automaticRepliesControlVersion, 0)
+    assert.equal(state.sessionsEnded, 1)
+  }, { responseMode: 'ai_automatic', businessAutomaticRepliesEnabled: true, jobInsertFails: true })
 })
 
 test('unsupported media events do not create inbound messages or AI jobs', async () => {

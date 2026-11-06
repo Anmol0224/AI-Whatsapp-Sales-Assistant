@@ -1,4 +1,5 @@
 import { recoverExpiredAiReplySendReservations } from "./ai-reply-job.repository.js";
+import { logAiPipelineTiming } from "./ai-pipeline-telemetry.js";
 
 export const AI_SEND_RECOVERY_INTERVAL_MS = 30_000;
 export const AI_SEND_RECOVERY_BATCH_LIMIT = 100;
@@ -45,9 +46,25 @@ export function createAiSendRecoveryRuntime(options: AiSendRecoveryRuntimeOption
 
     let cycle!: Promise<void>;
     cycle = Promise.resolve()
-      .then(() => recover(new Date(), batchLimit))
-      .then(() => undefined)
+      .then(async () => {
+        const startedAt = performance.now();
+        const recovered = await recover(new Date(), batchLimit);
+        if (recovered > 0) {
+          logAiPipelineTiming({
+            event: "ai_pipeline.automatic_reply_recovery",
+            stage: "automatic_send_recovery",
+            outcome: "recovered",
+            durationMs: performance.now() - startedAt,
+            recoveredCount: recovered,
+          });
+        }
+      })
       .catch(() => {
+        logAiPipelineTiming({
+          event: "ai_pipeline.automatic_reply_recovery",
+          stage: "automatic_send_recovery",
+          outcome: "recovery_error",
+        });
         try {
           reportError("database_recovery_failed");
         } catch {

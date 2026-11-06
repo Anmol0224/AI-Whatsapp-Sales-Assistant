@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
 import {
   ApiError,
+  getBusinessAiSettings,
   getConversationMessages,
   getConversationResponseMode,
   getConversations,
@@ -11,6 +12,7 @@ import {
   type InboxMessage,
   type ConversationListResponse,
   type ConversationMessagesResponse,
+  type BusinessAiSettingsResponse,
 } from '../services/api'
 
 const pageSize = 20
@@ -55,6 +57,12 @@ function messageStatusLabel(status: InboxMessage['status']): string {
     case 'read': return 'Read'
     case 'failed': return 'Failed'
   }
+}
+
+function responseModeLabel(mode: ConversationResponseMode): string {
+  if (mode === 'human') return 'Human'
+  if (mode === 'ai_automatic') return 'AI Automatic'
+  return 'AI Draft'
 }
 
 function ConversationItem({
@@ -178,7 +186,13 @@ function ErrorPanel({
   )
 }
 
-export function InboxPage() {
+export function InboxPage({
+  initialConversationId,
+  onInitialConversationHandled,
+}: {
+  initialConversationId?: string | null
+  onInitialConversationHandled?: () => void
+} = {}) {
   const [conversationPage, setConversationPage] = useState(1)
   const [conversationRetry, setConversationRetry] = useState(0)
   const [conversationResponse, setConversationResponse] = useState<ConversationListResponse | null>(null)
@@ -192,6 +206,10 @@ export function InboxPage() {
   const [responseModeSuccess, setResponseModeSuccess] = useState<string | null>(null)
   const [responseModeRetry, setResponseModeRetry] = useState(0)
   const responseModeSavingRef = useRef(false)
+  const [businessAiSettings, setBusinessAiSettings] = useState<BusinessAiSettingsResponse | null>(null)
+  const [businessAiSettingsError, setBusinessAiSettingsError] = useState<string | null>(null)
+  const [businessAiSettingsRetry, setBusinessAiSettingsRetry] = useState(0)
+  const [businessAiSettingsLoading, setBusinessAiSettingsLoading] = useState(true)
 
   const [messages, setMessages] = useState<InboxMessage[]>([])
   const [historyPage, setHistoryPage] = useState(1)
@@ -207,6 +225,25 @@ export function InboxPage() {
   const [scrollToNewest, setScrollToNewest] = useState(false)
   const sendingRef = useRef(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    let current = true
+    setBusinessAiSettingsLoading(true)
+    setBusinessAiSettingsError(null)
+    void getBusinessAiSettings()
+      .then((result) => {
+        if (current) setBusinessAiSettings(result)
+      })
+      .catch((error: unknown) => {
+        if (!current) return
+        setBusinessAiSettings(null)
+        setBusinessAiSettingsError(getErrorMessage(error, 'Business automatic-reply settings are unavailable.'))
+      })
+      .finally(() => {
+        if (current) setBusinessAiSettingsLoading(false)
+      })
+    return () => { current = false }
+  }, [businessAiSettingsRetry])
 
   useEffect(() => {
     const conversationId = selectedConversation?.id
@@ -251,9 +288,16 @@ export function InboxPage() {
           return
         }
         setConversationResponse(response)
-        setSelectedConversation((selected) =>
-          response.conversations.find((item) => item.id === selected?.id) ?? selected,
-        )
+        setSelectedConversation((selected) => {
+          if (initialConversationId) {
+            const target = response.conversations.find((item) => item.id === initialConversationId)
+            if (target) return target
+          }
+          return response.conversations.find((item) => item.id === selected?.id) ?? selected
+        })
+        if (initialConversationId && response.conversations.some((item) => item.id === initialConversationId)) {
+          onInitialConversationHandled?.()
+        }
       })
       .catch((error: unknown) => {
         if (current) setConversationsError(getErrorMessage(error, 'Unable to load conversations. Please retry.'))
@@ -313,12 +357,18 @@ export function InboxPage() {
     setSendOutcomeUncertain(false)
   }
 
+  const canSelectAutomaticMode = businessAiSettings?.automaticSendAvailable === true &&
+    businessAiSettings.aiSettings.automaticRepliesEnabled === true
+
   async function changeResponseMode(nextMode: ConversationResponseMode) {
     const conversation = selectedConversation
     if (!conversation || !responseMode || responseMode === nextMode || responseModeSavingRef.current) return
-    const confirmation = nextMode === 'ai'
-      ? 'Switch this conversation to AI mode? AI may generate owner-reviewed drafts, but it will not send messages automatically.'
-      : 'Switch this conversation to Human mode? New AI draft generation will be paused.'
+    if (nextMode === 'ai_automatic' && !canSelectAutomaticMode) return
+    const confirmation = nextMode === 'ai_automatic'
+      ? 'Switch this conversation to AI Automatic? Eligible AI replies may be sent to the customer without per-message owner approval. Unsupported questions are escalated. Human takeover remains available.'
+      : nextMode === 'ai_draft'
+        ? 'Switch this conversation to AI Draft? AI can prepare owner-reviewed drafts, but it will not send them automatically.'
+        : 'Switch this conversation to Human mode? AI reply generation for this conversation will be paused.'
     if (!window.confirm(confirmation)) return
 
     responseModeSavingRef.current = true
@@ -438,6 +488,7 @@ export function InboxPage() {
   const pagination = conversationResponse?.pagination
   const totalPages = Math.max(1, pagination?.totalPages ?? 1)
   const hasOlderMessages = loadedHistoryPage > 0 && loadedHistoryPage < (historyResponse?.pagination.totalPages ?? 0)
+  const isAiDraftMode = responseMode === 'ai' || responseMode === 'ai_draft'
 
   return (
     <div className="space-y-6">
@@ -541,32 +592,60 @@ export function InboxPage() {
                       {responseModeLoading
                         ? 'Loading current mode…'
                         : responseMode
-                          ? `Currently ${responseMode === 'ai' ? 'AI draft mode' : 'Human mode'}.`
+                          ? `Currently ${responseModeLabel(responseMode)} mode.`
                           : 'Current mode is unavailable.'}
                     </p>
                   </div>
-                  <div className="inline-flex rounded-xl border border-slate-200 bg-white p-1" role="group" aria-label="Set conversation response mode">
-                    <button
-                      type="button"
-                      aria-pressed={responseMode === 'human'}
-                      disabled={responseModeLoading || responseModeSaving || responseMode === null || responseMode === 'human'}
-                      onClick={() => void changeResponseMode('human')}
-                      className={`rounded-lg px-3 py-2 text-xs font-semibold outline-none focus-visible:ring-2 focus-visible:ring-emerald-600 disabled:cursor-not-allowed ${responseMode === 'human' ? 'bg-slate-800 text-white' : 'text-slate-700 hover:bg-slate-100 disabled:opacity-50'}`}
-                    >
-                      {responseModeSaving && responseMode === 'ai' ? 'Switching…' : 'Human'}
-                    </button>
-                    <button
-                      type="button"
-                      aria-pressed={responseMode === 'ai'}
-                      disabled={responseModeLoading || responseModeSaving || responseMode === null || responseMode === 'ai'}
-                      onClick={() => void changeResponseMode('ai')}
-                      className={`rounded-lg px-3 py-2 text-xs font-semibold outline-none focus-visible:ring-2 focus-visible:ring-emerald-600 disabled:cursor-not-allowed ${responseMode === 'ai' ? 'bg-emerald-700 text-white' : 'text-slate-700 hover:bg-slate-100 disabled:opacity-50'}`}
-                    >
-                      {responseModeSaving && responseMode === 'human' ? 'Switching…' : 'AI'}
-                    </button>
-                  </div>
                 </div>
-                <p className="mt-2 text-[11px] leading-5 text-slate-500">AI mode can generate owner-reviewed drafts; it does not send messages automatically.</p>
+                <div className="mt-3 grid gap-2 sm:grid-cols-3" role="group" aria-label="Set conversation response mode">
+                  <button
+                    type="button"
+                    aria-pressed={responseMode === 'human'}
+                    disabled={responseModeLoading || responseModeSaving || responseMode === null || responseMode === 'human'}
+                    onClick={() => void changeResponseMode('human')}
+                    className={`rounded-xl border p-3 text-left outline-none transition focus-visible:ring-2 focus-visible:ring-emerald-600 disabled:cursor-not-allowed ${responseMode === 'human' ? 'border-slate-700 bg-slate-800 text-white' : 'border-slate-200 bg-white text-slate-800 hover:border-slate-300 disabled:opacity-50'}`}
+                  >
+                    <span className="block text-xs font-semibold">{responseModeSaving && responseMode === 'human' ? 'Switching…' : 'Human'}</span>
+                    <span className={`mt-1 block text-[11px] leading-4 ${responseMode === 'human' ? 'text-slate-200' : 'text-slate-500'}`}>AI generation is paused.</span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={isAiDraftMode}
+                    disabled={responseModeLoading || responseModeSaving || responseMode === null || isAiDraftMode}
+                    onClick={() => void changeResponseMode('ai_draft')}
+                    className={`rounded-xl border p-3 text-left outline-none transition focus-visible:ring-2 focus-visible:ring-emerald-600 disabled:cursor-not-allowed ${isAiDraftMode ? 'border-emerald-700 bg-emerald-700 text-white' : 'border-slate-200 bg-white text-slate-800 hover:border-emerald-300 disabled:opacity-50'}`}
+                  >
+                    <span className="block text-xs font-semibold">{responseModeSaving && responseMode === 'ai_draft' ? 'Switching…' : 'AI Draft'}</span>
+                    <span className={`mt-1 block text-[11px] leading-4 ${isAiDraftMode ? 'text-emerald-50' : 'text-slate-500'}`}>Owner reviews and sends each reply.</span>
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={responseMode === 'ai_automatic'}
+                    disabled={responseModeLoading || responseModeSaving || responseMode === null || responseMode === 'ai_automatic' || !canSelectAutomaticMode}
+                    onClick={() => void changeResponseMode('ai_automatic')}
+                    className={`rounded-xl border p-3 text-left outline-none transition focus-visible:ring-2 focus-visible:ring-emerald-600 disabled:cursor-not-allowed ${responseMode === 'ai_automatic' ? 'border-amber-700 bg-amber-700 text-white' : 'border-slate-200 bg-white text-slate-800 hover:border-amber-300 disabled:opacity-50'}`}
+                  >
+                    <span className="block text-xs font-semibold">{responseModeSaving && responseMode === 'ai_automatic' ? 'Switching…' : 'AI Automatic'}</span>
+                    <span className={`mt-1 block text-[11px] leading-4 ${responseMode === 'ai_automatic' ? 'text-amber-50' : 'text-slate-500'}`}>Eligible replies may send without approval.</span>
+                  </button>
+                </div>
+                <div className="mt-2">
+                  {businessAiSettingsLoading ? (
+                    <p role="status" className="text-[11px] text-slate-500">Checking platform availability and business opt-in…</p>
+                  ) : businessAiSettingsError ? (
+                    <div className="flex flex-wrap items-center gap-2" role="alert">
+                      <p className="text-[11px] text-rose-700">{businessAiSettingsError} AI Automatic is unavailable until settings load.</p>
+                      <button type="button" onClick={() => setBusinessAiSettingsRetry((retry) => retry + 1)} className="rounded-md border border-rose-200 px-2 py-1 text-[11px] font-semibold text-rose-800">Retry</button>
+                    </div>
+                  ) : !businessAiSettings?.automaticSendAvailable ? (
+                    <p className="text-[11px] text-amber-800">AI Automatic is unavailable because the platform gate is off.</p>
+                  ) : !businessAiSettings.aiSettings.automaticRepliesEnabled ? (
+                    <p className="text-[11px] text-amber-800">Enable business automatic-reply opt-in in Business Profile before selecting AI Automatic.</p>
+                  ) : (
+                    <p className="text-[11px] text-slate-500">Platform gate and business opt-in are enabled; choose AI Automatic for this conversation explicitly.</p>
+                  )}
+                </div>
+                <p className="mt-2 text-[11px] leading-5 text-slate-500">AI Draft never sends automatically. AI Automatic may send only eligible, validated replies; unsupported questions are escalated. Human mode remains available for takeover.</p>
                 {responseModeLoading && <p role="status" className="sr-only">Loading conversation response mode.</p>}
                 {responseModeError && (
                   <div className="mt-2 flex flex-wrap items-center justify-between gap-2" role="alert">

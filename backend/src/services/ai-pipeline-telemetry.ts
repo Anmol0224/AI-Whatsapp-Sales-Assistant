@@ -7,7 +7,13 @@ export type AiPipelineTimingEventName =
   | "ai_pipeline.context_retrieval"
   | "ai_pipeline.gemini_request"
   | "ai_pipeline.draft_persistence"
-  | "ai_pipeline.job_processing";
+  | "ai_pipeline.job_processing"
+  | "ai_pipeline.automatic_reply_validation"
+  | "ai_pipeline.automatic_reply_escalation"
+  | "ai_pipeline.automatic_reply_persistence"
+  | "ai_pipeline.automatic_reply_reservation"
+  | "ai_pipeline.automatic_reply_send"
+  | "ai_pipeline.automatic_reply_recovery";
 
 export type AiPipelineTimingStage =
   | "http_processing"
@@ -18,7 +24,13 @@ export type AiPipelineTimingStage =
   | "business_context"
   | "gemini_generation"
   | "draft_persistence"
-  | "job_processing";
+  | "job_processing"
+  | "safety_validation"
+  | "escalation_persistence"
+  | "automatic_reply_persistence"
+  | "send_reservation"
+  | "automatic_send"
+  | "automatic_send_recovery";
 
 export type AiPipelineTimingOutcome =
   | "success"
@@ -52,7 +64,28 @@ export type AiPipelineTimingOutcome =
   | "internal_error"
   | "context_unavailable"
   | "validation_rejected"
-  | "retryable_failure";
+  | "retryable_failure"
+  | "safe_to_auto_reply"
+  | "needs_owner_review"
+  | "unsupported_information"
+  | "ambiguous_request"
+  | "missing_business_information"
+  | "policy_conflict"
+  | "invalid_or_empty_response"
+  | "created"
+  | "already_exists"
+  | "reserved"
+  | "already_sent"
+  | "in_progress"
+  | "ineligible"
+  | "safety_rejected"
+  | "not_configured"
+  | "sent"
+  | "send_failed"
+  | "send_uncertain"
+  | "escalated"
+  | "recovered"
+  | "attempted";
 
 export type AiPipelineProviderCategory =
   | "rate_limited"
@@ -85,6 +118,9 @@ export interface AiPipelineTimingFields {
   providerHttpStatus?: number;
   providerNetworkCode?: string;
   retryable?: boolean;
+  faqEvidenceCount?: number;
+  catalogEvidenceCount?: number;
+  recoveredCount?: number;
 }
 
 const eventNames = new Set<AiPipelineTimingEventName>([
@@ -97,6 +133,12 @@ const eventNames = new Set<AiPipelineTimingEventName>([
   "ai_pipeline.gemini_request",
   "ai_pipeline.draft_persistence",
   "ai_pipeline.job_processing",
+  "ai_pipeline.automatic_reply_validation",
+  "ai_pipeline.automatic_reply_escalation",
+  "ai_pipeline.automatic_reply_persistence",
+  "ai_pipeline.automatic_reply_reservation",
+  "ai_pipeline.automatic_reply_send",
+  "ai_pipeline.automatic_reply_recovery",
 ]);
 
 const stages = new Set<AiPipelineTimingStage>([
@@ -109,6 +151,12 @@ const stages = new Set<AiPipelineTimingStage>([
   "gemini_generation",
   "draft_persistence",
   "job_processing",
+  "safety_validation",
+  "escalation_persistence",
+  "automatic_reply_persistence",
+  "send_reservation",
+  "automatic_send",
+  "automatic_send_recovery",
 ]);
 
 const outcomes = new Set<AiPipelineTimingOutcome>([
@@ -144,6 +192,27 @@ const outcomes = new Set<AiPipelineTimingOutcome>([
   "context_unavailable",
   "validation_rejected",
   "retryable_failure",
+  "safe_to_auto_reply",
+  "needs_owner_review",
+  "unsupported_information",
+  "ambiguous_request",
+  "missing_business_information",
+  "policy_conflict",
+  "invalid_or_empty_response",
+  "created",
+  "already_exists",
+  "reserved",
+  "already_sent",
+  "in_progress",
+  "ineligible",
+  "safety_rejected",
+  "not_configured",
+  "sent",
+  "send_failed",
+  "send_uncertain",
+  "escalated",
+  "recovered",
+  "attempted",
 ]);
 
 const providerCategories = new Set<AiPipelineProviderCategory>([
@@ -221,6 +290,15 @@ export function logAiPipelineTiming(fields: AiPipelineTimingFields): void {
     event.providerNetworkCode = fields.providerNetworkCode;
   }
   if (typeof fields.retryable === "boolean") event.retryable = fields.retryable;
+  if (Number.isSafeInteger(fields.faqEvidenceCount) && fields.faqEvidenceCount! >= 0 && fields.faqEvidenceCount! <= 20) {
+    event.faqEvidenceCount = fields.faqEvidenceCount!;
+  }
+  if (Number.isSafeInteger(fields.catalogEvidenceCount) && fields.catalogEvidenceCount! >= 0 && fields.catalogEvidenceCount! <= 30) {
+    event.catalogEvidenceCount = fields.catalogEvidenceCount!;
+  }
+  if (Number.isSafeInteger(fields.recoveredCount) && fields.recoveredCount! >= 0 && fields.recoveredCount! <= 1000) {
+    event.recoveredCount = fields.recoveredCount!;
+  }
 
   try {
     console.info(JSON.stringify(event));

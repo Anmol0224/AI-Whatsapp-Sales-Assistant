@@ -4,6 +4,7 @@ export type AiReplyJobStatus =
   | "queued"
   | "processing"
   | "draft_ready"
+  | "automatic_ready"
   | "approved"
   | "rejected"
   | "sending"
@@ -12,6 +13,16 @@ export type AiReplyJobStatus =
   | "send_uncertain"
   | "failed"
   | "cancelled";
+export type AiReplyJobWorkflow = "ai_draft" | "ai_automatic";
+export type AiReplySendProvenance = "owner_approved" | "automatic_policy";
+export type AiReplyAutomaticSafetyDecision = "eligible" | "unsupported" | "uncertain";
+export type AiReplyEscalationReason =
+  | "unsupported_query"
+  | "insufficient_context"
+  | "ambiguous_answer"
+  | "safety_check_failed"
+  | "automatic_replies_disabled"
+  | "provider_generation_failed";
 export type AiReplyJobErrorCode =
   | "context_unavailable"
   | "provider_unavailable"
@@ -34,6 +45,8 @@ export interface AiReplyJobFields {
   businessId: Types.ObjectId;
   conversationId: Types.ObjectId;
   inboundMessageId: Types.ObjectId;
+  /** Legacy documents without this field are draft workflow; the schema default is ai_draft. */
+  workflow?: AiReplyJobWorkflow;
   status: AiReplyJobStatus;
   attemptCount: number;
   nextAttemptAt: Date;
@@ -58,6 +71,14 @@ export interface AiReplyJobFields {
   providerStatusCode?: number;
   providerMessageId?: string;
   outboundMessageId?: Types.ObjectId;
+  /** Send provenance and bounded automatic-policy snapshots; automatic replies are never owner-approved. */
+  sendProvenance?: AiReplySendProvenance;
+  automaticReplyTextSnapshot?: string;
+  automaticEvidence?: Array<{ kind: "faq" | "catalog_item"; recordId: Types.ObjectId }>;
+  automaticSafetyDecision?: AiReplyAutomaticSafetyDecision;
+  escalationReason?: AiReplyEscalationReason;
+  automaticPolicyVersion?: string;
+  workflowControlVersion?: number;
   errorCode?: AiReplyJobErrorCode;
   createdAt: Date;
   updatedAt: Date;
@@ -80,12 +101,18 @@ const aiReplyJobSchema = new mongoose.Schema<AiReplyJobFields>(
       ref: "Message",
       required: true,
     },
+    workflow: {
+      type: String,
+      enum: ["ai_draft", "ai_automatic"],
+      default: "ai_draft",
+    },
     status: {
       type: String,
       enum: [
         "queued",
         "processing",
         "draft_ready",
+        "automatic_ready",
         "approved",
         "rejected",
         "sending",
@@ -184,6 +211,58 @@ const aiReplyJobSchema = new mongoose.Schema<AiReplyJobFields>(
     outboundMessageId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "Message",
+    },
+    sendProvenance: {
+      type: String,
+      enum: ["owner_approved", "automatic_policy"],
+    },
+    automaticReplyTextSnapshot: {
+      type: String,
+      trim: true,
+      minlength: 1,
+      maxlength: 4096,
+    },
+    automaticEvidence: {
+      type: [{
+        kind: { type: String, enum: ["faq", "catalog_item"], required: true },
+        recordId: { type: mongoose.Schema.Types.ObjectId, required: true },
+      }],
+      default: undefined,
+      validate: {
+        validator: (value: Array<{ kind: string; recordId: Types.ObjectId }>) => value.length <= 50,
+        message: "automaticEvidence must contain at most 50 references.",
+      },
+    },
+    automaticSafetyDecision: {
+      type: String,
+      enum: ["eligible", "unsupported", "uncertain"],
+    },
+    escalationReason: {
+      type: String,
+      enum: [
+        "unsupported_query",
+        "insufficient_context",
+        "ambiguous_answer",
+        "safety_check_failed",
+        "automatic_replies_disabled",
+        "provider_generation_failed",
+      ],
+      maxlength: 64,
+    },
+    automaticPolicyVersion: {
+      type: String,
+      trim: true,
+      minlength: 1,
+      maxlength: 64,
+      match: [/^[A-Za-z0-9._-]+$/, "automaticPolicyVersion must be a safe version identifier."],
+    },
+    workflowControlVersion: {
+      type: Number,
+      min: 0,
+      validate: {
+        validator: (value: number) => Number.isSafeInteger(value),
+        message: "workflowControlVersion must be a non-negative safe integer.",
+      },
     },
     errorCode: {
       type: String,

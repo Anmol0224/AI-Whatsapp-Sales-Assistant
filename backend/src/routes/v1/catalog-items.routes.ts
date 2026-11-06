@@ -1,7 +1,9 @@
 import { Router } from "express";
+import { Types } from "mongoose";
 import { z } from "zod";
 import { authenticate } from "../../middleware/auth.middleware.js";
 import { CatalogItem } from "../../models/catalog-item.model.js";
+import { withAutomaticReplyPolicyMutation } from "../../services/automatic-reply-policy.repository.js";
 
 const catalogItemsRouter = Router();
 const objectIdSchema = z.string().regex(/^[a-f\d]{24}$/i, "A valid catalog item ID is required.");
@@ -151,11 +153,19 @@ catalogItemsRouter.post("/", async (request, response, next) => {
   }
 
   try {
-    const item = await CatalogItem.create({
-      ...parsedBody.data,
-      businessId: auth.businessId,
-      isActive: true,
+    const businessId = new Types.ObjectId(auth.businessId);
+    const item = await withAutomaticReplyPolicyMutation(businessId, async (session) => {
+      const [created] = await CatalogItem.create([{
+        ...parsedBody.data,
+        businessId,
+        isActive: true,
+      }], { session });
+      return created ?? null;
     });
+    if (!item) {
+      response.status(404).json({ success: false, message: "Business not found." });
+      return;
+    }
     response.status(201).json({ success: true, item: safeCatalogItem(item) });
   } catch (error) {
     next(error);
@@ -224,10 +234,13 @@ catalogItemsRouter.patch("/:id", async (request, response, next) => {
   }
 
   try {
-    const item = await CatalogItem.findOneAndUpdate(
-      { _id: parsedId.data, businessId: auth.businessId },
-      { $set: parsedBody.data },
-      { returnDocument: "after", runValidators: true },
+    const businessId = new Types.ObjectId(auth.businessId);
+    const item = await withAutomaticReplyPolicyMutation(businessId, (session) =>
+      CatalogItem.findOneAndUpdate(
+        { _id: parsedId.data, businessId },
+        { $set: parsedBody.data },
+        { session, returnDocument: "after", runValidators: true },
+      ).exec(),
     );
 
     if (!item) {
@@ -259,10 +272,13 @@ catalogItemsRouter.delete("/:id", async (request, response, next) => {
   }
 
   try {
-    const item = await CatalogItem.findOneAndUpdate(
-      { _id: parsedId.data, businessId: auth.businessId },
-      { $set: { isActive: false } },
-      { returnDocument: "after", runValidators: true },
+    const businessId = new Types.ObjectId(auth.businessId);
+    const item = await withAutomaticReplyPolicyMutation(businessId, (session) =>
+      CatalogItem.findOneAndUpdate(
+        { _id: parsedId.data, businessId },
+        { $set: { isActive: false } },
+        { session, returnDocument: "after", runValidators: true },
+      ).exec(),
     );
 
     if (!item) {

@@ -5,6 +5,12 @@ export interface BusinessWhatsappSettings {
   displayNumber?: string;
   connectionStatus: string;
   credentialRef?: string;
+  verifiedPhoneNumberId?: string;
+  lastVerificationAt?: Date;
+  verificationFailureCategory?: string;
+  verifiedDisplayNumber?: string;
+  verifiedName?: string;
+  qualityRating?: "GREEN" | "YELLOW" | "RED" | "UNKNOWN";
 }
 
 export interface BusinessAiSettings {
@@ -13,6 +19,14 @@ export interface BusinessAiSettings {
   modelConfiguration?: Record<string, unknown>;
   contextMessageLimit?: number;
   communicationPreferences?: string;
+  automaticRepliesEnabled?: boolean;
+  automaticRepliesEnabledAt?: Date;
+  automaticRepliesEnabledByUserId?: Types.ObjectId;
+  automaticRepliesDisabledAt?: Date;
+  automaticRepliesDisabledByUserId?: Types.ObjectId;
+  automaticRepliesPolicyVersion?: string;
+  /** Internal fence shared by automatic-send reservations and policy/source mutations. */
+  automaticRepliesControlVersion?: number;
 }
 
 export interface BusinessFields {
@@ -34,6 +48,29 @@ const whatsappSettingsSchema = new mongoose.Schema<BusinessWhatsappSettings>(
     displayNumber: { type: String, trim: true },
     connectionStatus: { type: String, default: "not_configured", trim: true },
     credentialRef: { type: String, trim: true },
+    verifiedPhoneNumberId: { type: String, trim: true },
+    lastVerificationAt: { type: Date },
+    verificationFailureCategory: {
+      type: String,
+      trim: true,
+      enum: [
+        "missing_access_token",
+        "missing_graph_api_version",
+        "provider_authentication_failed",
+        "missing_permissions",
+        "invalid_phone_number_id",
+        "invalid_phone_number_id_at_provider",
+        "provider_rate_limited",
+        "provider_timeout",
+        "provider_network_error",
+        "provider_unavailable",
+        "unexpected_provider_response",
+        "phone_number_id_mismatch",
+      ],
+    },
+    verifiedDisplayNumber: { type: String, trim: true, maxlength: 32 },
+    verifiedName: { type: String, trim: true, maxlength: 256 },
+    qualityRating: { type: String, enum: ["GREEN", "YELLOW", "RED", "UNKNOWN"] },
   },
   { _id: false },
 );
@@ -52,6 +89,33 @@ const aiSettingsSchema = new mongoose.Schema<BusinessAiSettings>(
       },
     },
     communicationPreferences: { type: String, trim: true },
+    automaticRepliesEnabled: { type: Boolean, default: false },
+    automaticRepliesEnabledAt: { type: Date },
+    automaticRepliesEnabledByUserId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    },
+    automaticRepliesDisabledAt: { type: Date },
+    automaticRepliesDisabledByUserId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    },
+    automaticRepliesPolicyVersion: {
+      type: String,
+      trim: true,
+      minlength: 1,
+      maxlength: 64,
+      match: [/^[A-Za-z0-9._-]+$/, "automaticRepliesPolicyVersion must be a safe version identifier."],
+    },
+    automaticRepliesControlVersion: {
+      type: Number,
+      min: 0,
+      default: 0,
+      validate: {
+        validator: (value: number) => Number.isSafeInteger(value),
+        message: "automaticRepliesControlVersion must be a non-negative safe integer.",
+      },
+    },
   },
   { _id: false },
 );
@@ -107,7 +171,7 @@ const businessSchema = new mongoose.Schema<BusinessFields>(
       type: whatsappSettingsSchema,
       default: () => ({}),
     },
-    aiSettings: { type: aiSettingsSchema },
+    aiSettings: { type: aiSettingsSchema, default: () => ({}) },
   },
   { timestamps: true },
 );

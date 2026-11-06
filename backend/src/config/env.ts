@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import { z } from "zod";
+import { strictBooleanEnvSchema } from "./strict-boolean-env.js";
 
 const envFilePath = fileURLToPath(new URL("../../.env", import.meta.url));
 const dotenvResult = dotenv.config({ path: envFilePath });
@@ -106,6 +107,7 @@ const environmentSchema = z.object({
     )
     .transform((value) => value === "true"),
   AI_DRAFT_WORKER_POLL_INTERVAL_MS: z.coerce.number().int().min(250).max(60_000).default(5_000),
+  AI_AUTOMATIC_SEND_ENABLED: strictBooleanEnvSchema,
 });
 
 const parsedEnvironment = environmentSchema.safeParse(process.env);
